@@ -1,0 +1,8 @@
+panda-python
+stable-baselines3
+gymnasium
+panda-gym
+numpy
+torch
+pyrealsense2
+opencv-python

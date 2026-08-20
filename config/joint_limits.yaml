@@ -1,0 +1,35 @@
+# Franka Emika Panda Joint Limits
+# Source: Official Franka Emika Datasheet (April 2020)
+# Units: radians
+
+hardware_limits:
+  A1: [-2.8973, 2.8973]   # ±166°
+  A2: [-1.7628, 1.7628]   # ±101°
+  A3: [-2.8973, 2.8973]   # ±166°
+  A4: [-3.0718, -0.0698]  # -176° to -4°
+  A5: [-2.8973, 2.8973]   # ±166°
+  A6: [-0.0175, 3.7525]   # -1° to 215°
+  A7: [-2.8973, 2.8973]   # ±166°
+
+# Joint velocity limits (rad/s)
+velocity_limits:
+  A1: 2.62   # 150°/s
+  A2: 2.62   # 150°/s
+  A3: 2.62   # 150°/s
+  A4: 2.62   # 150°/s
+  A5: 5.26   # 180°/s (datasheet: 300°/s for A5-A7, using conservative value)
+  A6: 4.18   # 180°/s
+  A7: 5.26   # 180°/s
+
+# Safety margin for software limits (radians)
+safety_margin: 0.2
+
+# Default control parameters (conservative for first-time testing)
+control:
+  max_delta: 0.01         # max change per step (radians)
+  max_deviation: 0.2      # max deviation from current position (radians)
+  control_frequency: 10   # Hz
+  max_runtime: 5          # seconds
+
+# Standard start position (radians)
+start_position: [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
