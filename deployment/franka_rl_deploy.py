@@ -20,15 +20,14 @@ import numpy as np
 import logging
 import os
 
+
 # ============ Configuration ============
 logging.basicConfig(level=logging.INFO)
-
-HOSTNAME = os.environ.get('PANDA_HOST', '192.168.3.100')
-USERNAME = os.environ.get('PANDA_USER', 'user')
-PASSWORD = os.environ.get('PANDA_PASS', 'password')
+# jac = np.array(panda.get_model().zero_jacobian(state)).reshape(6, 7, order='F')
+HOSTNAME = os.environ.get('PANDA_HOST', '192.168.1.8')
 
 # >>> CHANGE THIS LINE TO DEPLOY A DIFFERENT ALGORITHM <<<
-CHECKPOINT_PATH = '../checkpoints/panda_reach_ppo_40000_steps'
+CHECKPOINT_PATH = 'checkpoints/panda_reach_ppo_40000_steps'
 
 # Path to VecNormalize stats saved during training (set to None if not used).
 # If training used VecNormalize and you skip this, the policy will silently misbehave.
@@ -85,7 +84,8 @@ def build_observation(panda, state, target_pos):
     ee_pos = np.asarray(panda.get_position())
 
     # EE linear velocity: J(q) @ dq, take translational part
-    jac = np.array(panda.get_model().zero_jacobian(state)).reshape(6, 7, order='F')
+    from panda_py import libfranka
+    jac = np.array(panda.get_model().zero_jacobian(libfranka.Frame.kEndEffector,state)).reshape(6,7,order='F')
     ee_vel = jac[:3] @ np.array(state.dq)
 
     return {
@@ -147,16 +147,16 @@ def debug_action(target_q, safe_act, step):
 # ============ Main ============
 def main():
     # --- Step 1: Connect to Desk ---
-    print("=" * 50)
-    print("Step 1: Connecting to Desk...")
-    desk = panda_py.Desk(HOSTNAME, USERNAME, PASSWORD)
-    try:
-        desk.take_control()  # required on newer firmware; harmless otherwise
-    except Exception:
-        pass
-    desk.unlock()
-    desk.activate_fci()
-    print("Desk connected, brakes unlocked, FCI activated.")
+    # print("=" * 50)
+    # print("Step 1: Connecting to Desk...")
+    # # # desk = panda_py.Desk(HOSTNAME, USERNAME, PASSWORD)
+    # # try:
+    # #     desk.take_control()  # required on newer firmware; harmless otherwise
+    # # except Exception:
+    # #     pass
+    # # desk.unlock()
+    # # desk.activate_fci()
+    # print("Desk connected, brakes unlocked, FCI activated.")
 
     # --- Step 2: Connect to robot ---
     print("=" * 50)

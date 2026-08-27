@@ -26,12 +26,12 @@ ACTION_SCALE = 0.05
 
 # Safety
 MAX_STEP = 0.03        # max EE displacement per control step (m) - conservative
-CONTROL_FREQ = 20      # Hz
-MAX_RUNTIME = 15       # seconds
+CONTROL_FREQ = 20   # Hz
+MAX_RUNTIME = 30      # seconds
 GOAL_THRESHOLD = 0.05  # distance to consider goal reached (m)
 
 # Set to True to run inference WITHOUT sending commands (safe dry run)
-DRY_RUN = True
+DRY_RUN = False
 
 
 # ============ Coordinate Conversion ============
@@ -77,7 +77,7 @@ def main():
     print("Policy loaded")
 
     # --- Get start position and orientation ---
-    x0 = panda.get_position()      # current EE position (xyz)
+    x0 = panda.get_position()      # current EE position (xyz)1, 0.1, -0
     q0 = panda.get_orientation()   # current EE orientation (quaternion) - keep fixed
     print(f"Start EE position (real): {x0.round(3)}")
 
@@ -157,10 +157,10 @@ def main():
 
                 if step_count % CONTROL_FREQ == 0:  # print once per second
                     print(f"Step {step_count}: pos={current_pos.round(3)} "
-                          f"action={raw_action.round(3)} dist={dist:.3f}")
+                          f"action={raw_action.round(3)} dist={dist*100:.3f}cm")
 
                 if dist < GOAL_THRESHOLD:
-                    print(f"\nGoal reached! Final distance: {dist:.3f}")
+                    print(f"\nGoal reached! Final distance: {dist*100:.3f}cm")
                     break
 
     except KeyboardInterrupt:
