@@ -1,4 +1,4 @@
-# Development Log — Manchester Lab Visit (2 days)
+# Development Log — Manchester Lab Visit 
 
 ## Overview
 
