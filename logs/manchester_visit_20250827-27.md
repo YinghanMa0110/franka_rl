@@ -6,7 +6,7 @@ First hands-on session with the real Franka Emika Panda robot at the University 
 
 ---
 
-## Day 1: Real Robot Deployment
+## Real Robot Deployment
 
 ### Environment Setup
 - Connected to Jetson (tegra-ubuntu) via VS Code Remote
@@ -41,6 +41,14 @@ Start EE position: [0.307, -0.000, 0.487]
 Target position:   [0.407,  0.100, 0.387]
 Final distance:    0.066 m (goal threshold: 0.05 m)
 ```
+### Reproducibility Check
+
+Ran the same deployment configuration again on a separate occasion:
+- Same parameters (freq=20Hz, action_scale=0.05, max_step=0.03m)
+- Result: converged to ~6.26cm (vs 6.6cm in the first run)
+- Confirms the ~6cm final distance is a **stable, repeatable outcome** of this checkpoint/parameter combination, not a one-off result
+
+This stability is actually useful evidence: it suggests the gap is systematic (likely sim-to-real coordinate/dynamics mismatch) rather than random noise, which points toward the sim-to-real fixes discussed (BASE_OFFSET precision, domain randomization, or fine-tuning) rather than just re-running with different random seeds.
 
 The policy successfully moved the real robot's end-effector toward the target over 300 control steps, confirming the full pipeline works: connect → load checkpoint → build observation → policy inference → safety filtering → execute on hardware → safe shutdown.
 
@@ -51,7 +59,7 @@ panda-gym's PandaReach places the simulated robot base at world-frame offset `[-
 
 ---
 
-## Day 2: CleanRL Investigation (per Hossein's guidance)
+## CleanRL Investigation (per Hossein's guidance)
 
 **Context:** Hossein noted that SB3 is a "black box" — unsuitable for algorithm-level research (e.g. modifying PPO's update rule for the pi-PG approach), since its internals aren't easily inspectable or modifiable. CleanRL was recommended instead, as each algorithm is a single, fully transparent file.
 
