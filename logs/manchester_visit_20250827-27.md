@@ -10,9 +10,8 @@ First hands-on session with the real Franka Emika Panda robot at the University 
 
 ### Environment Setup
 - Connected to Jetson (tegra-ubuntu) via VS Code Remote
-- Cloned `franka_rl` repo, installed dependencies (panda-py, stable-baselines3, gymnasium, panda-gym)
+- Cloned `franka_rl` repo, installed dependencies (stable-baselines3)
 - Robot IP: `192.168.1.8`
-- Used browser-based Desk interface to unlock brakes and activate FCI manually (skipped in-code Desk connection)
 
 ### Bug Fixes During Deployment
 
@@ -45,7 +44,7 @@ Final distance:    0.066 m (goal threshold: 0.05 m)
 
 The policy successfully moved the real robot's end-effector toward the target over 300 control steps, confirming the full pipeline works: connect → load checkpoint → build observation → policy inference → safety filtering → execute on hardware → safe shutdown.
 
-**Sim-to-real gap observed:** simulation success rate was 90-100%; real robot reached 0.066 m vs the 0.05 m threshold — close but not within tolerance. Consistent with the sim-to-real degradation reported in Lobbezoo & Kwon (2023).
+**Sim-to-real gap observed:** simulation success rate was 90-100%; real robot reached 6.6 cm vs the 5 cm threshold — close but not within tolerance. Consistent with the sim-to-real degradation reported in Lobbezoo & Kwon (2023).
 
 ### Coordinate System Note
 panda-gym's PandaReach places the simulated robot base at world-frame offset `[-0.6, 0, 0]`. A `BASE_OFFSET` correction was applied when converting real robot coordinates into the frame the policy was trained on.
