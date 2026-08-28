@@ -9,9 +9,7 @@ import panda_gym
 from stable_baselines3 import PPO
 
 # ============ Configuration ============
-CHECKPOINT_PATH = '../checkpoints/panda_reach_ppo_40000_steps'
-ENV_NAME = 'PandaReach-v3'
-REWARD_TYPE = 'dense'
+checkpoint = torch.load('runs/PandaReach-v3__ppo_continuous_action__1__1787868781/ppo_continuous_action.cleanrl_model', map_location='cpu')
 NUM_EPISODES = 10
 RENDER = True
 STEP_DELAY = 0.05  # seconds between steps (for visualization)

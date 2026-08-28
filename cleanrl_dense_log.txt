@@ -1,0 +1,10 @@
+nohup: ignoring input
+/home/mayinghan/.local/lib/python3.12/site-packages/tyro/_parsers.py:365: UserWarning: The field `wandb-entity` is annotated with type `<class 'str'>`, but the default value `None` has type `<class 'NoneType'>`. We'll try to handle this gracefully, but it may cause unexpected behavior.
+  warnings.warn(message)
+/home/mayinghan/.local/lib/python3.12/site-packages/tyro/_parsers.py:365: UserWarning: The field `target-kl` is annotated with type `<class 'float'>`, but the default value `None` has type `<class 'NoneType'>`. We'll try to handle this gracefully, but it may cause unexpected behavior.
+  warnings.warn(message)
+╭─ Unrecognized options ──────────────────────────────────────────────────╮
+│ Unrecognized options: False                                             │
+│ ─────────────────────────────────────────────────────────────────────── │
+│ For full helptext, run training/cleanrl/ppo_continuous_action.py --help │
+╰─────────────────────────────────────────────────────────────────────────╯
