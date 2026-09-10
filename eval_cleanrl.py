@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import csv
 
 import gymnasium as gym
 import numpy as np
@@ -21,21 +22,14 @@ CLEANRL_DIR = os.path.join(
 )
 
 if CLEANRL_DIR not in sys.path:
-    sys.path.insert(
-        0,
-        CLEANRL_DIR,
-    )
+    sys.path.insert(0, CLEANRL_DIR)
 
 
 # ============================================================
-# Import training definitions
+# Import EXACT Agent used for training
 # ============================================================
 
-from ppo_cont_2 import (  # noqa: E402
-    Agent,
-    Args,
-    make_env,
-)
+from ppo_continuous_action import Agent  # noqa: E402
 
 
 # ============================================================
@@ -48,8 +42,13 @@ REWARD_TYPE = "dense"
 
 CONTROL_TYPE = "joints"
 
+# Must match training
 DISTANCE_THRESHOLD = 0.02  # 2 cm
 
+
+# ------------------------------------------------------------
+# Evaluation
+# ------------------------------------------------------------
 
 N_EPISODES = 20
 
@@ -57,13 +56,39 @@ DETERMINISTIC = True
 
 SEED = 0
 
-RENDER = True
-
-STEP_SLEEP = 0.05
-
-PAUSE_BETWEEN_EPISODES = False
-
 DEBUG = True
+
+STEP_SLEEP = 0.00
+
+
+# ------------------------------------------------------------
+# Video
+#
+# RECORD_VIDEO=True:
+#   Save MP4 evaluation videos.
+#
+# SHOW_LIVE=True:
+#   Show PyBullet window live.
+#
+# You normally cannot use both modes with the same env because
+# Gymnasium render_mode is selected when creating the env.
+# ------------------------------------------------------------
+
+RECORD_VIDEO = True
+
+SHOW_LIVE = False
+
+VIDEO_DIR = os.path.join(
+    ROOT,
+    "videos",
+    "reach_joint_2cm_eval",
+)
+
+RESULT_CSV = os.path.join(
+    ROOT,
+    "results",
+    "reach_joint_2cm_eval.csv",
+)
 
 
 # ============================================================
@@ -71,10 +96,6 @@ DEBUG = True
 # ============================================================
 
 def find_wrapper(env, cls):
-    """
-    Search through Gymnasium wrappers and return
-    the first wrapper matching cls.
-    """
 
     w = env
 
@@ -89,67 +110,68 @@ def find_wrapper(env, cls):
 
 
 # ============================================================
-# Render environment
+# Build evaluation environment
 # ============================================================
 
-def make_render_env(
-    env_id,
+def build_env(
+    record_video=False,
+    show_live=False,
 ):
     """
-    Reconstruct the same environment used during training,
-    but with human rendering enabled.
+    Build Reach evaluation environment.
 
-    IMPORTANT:
-    Wrapper order must match training.
+    panda-gym version used here requires render_mode
+    to be either "rgb_array" or "human".
     """
 
+    if record_video and show_live:
+        raise ValueError(
+            "RECORD_VIDEO and SHOW_LIVE cannot both be True."
+        )
+
+    # IMPORTANT:
+    # Always define render_mode
+    if show_live:
+        render_mode = "human"
+    else:
+        render_mode = "rgb_array"
+
     env = gym.make(
-        env_id,
+        ENV_ID,
         reward_type=REWARD_TYPE,
         control_type=CONTROL_TYPE,
-        render_mode="human",
+        render_mode=render_mode,
     )
 
-    # --------------------------------------------------------
-    # Use the SAME success threshold as training
-    # --------------------------------------------------------
+    # Same 2 cm threshold as training
+    env.unwrapped.task.distance_threshold = DISTANCE_THRESHOLD
 
-    env.unwrapped.task.distance_threshold = (
-        DISTANCE_THRESHOLD
-    )
+    # Video recording
+    if record_video:
+        os.makedirs(
+            VIDEO_DIR,
+            exist_ok=True,
+        )
 
-    print(
-        "Evaluation distance threshold:",
-        env.unwrapped.task.distance_threshold,
-    )
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=VIDEO_DIR,
+            episode_trigger=lambda episode_id: True,
+            name_prefix="ppo_reach_joint_2cm",
+        )
 
-    # --------------------------------------------------------
     # Same wrappers as training
-    # --------------------------------------------------------
+    env = gym.wrappers.FlattenObservation(env)
 
-    env = gym.wrappers.FlattenObservation(
-        env
-    )
+    env = gym.wrappers.RecordEpisodeStatistics(env)
 
-    env = gym.wrappers.RecordEpisodeStatistics(
-        env
-    )
+    env = gym.wrappers.ClipAction(env)
 
-    env = gym.wrappers.ClipAction(
-        env
-    )
-
-    env = gym.wrappers.NormalizeObservation(
-        env
-    )
+    env = gym.wrappers.NormalizeObservation(env)
 
     env = gym.wrappers.TransformObservation(
         env,
-        lambda obs: np.clip(
-            obs,
-            -10,
-            10,
-        ),
+        lambda obs: np.clip(obs, -10, 10),
         env.observation_space,
     )
 
@@ -164,17 +186,12 @@ def load_and_freeze_obs_rms(
     env,
     obs_rms_path,
 ):
-    """
-    Load the observation running mean/variance from training.
-
-    This is essential because the policy was trained with
-    NormalizeObservation.
-    """
 
     norm_w = find_wrapper(
         env,
         gym.wrappers.NormalizeObservation,
     )
+
 
     if norm_w is None:
 
@@ -182,9 +199,11 @@ def load_and_freeze_obs_rms(
             "NormalizeObservation wrapper not found."
         )
 
+
     data = np.load(
         obs_rms_path
     )
+
 
     norm_w.obs_rms.mean = (
         data["mean"].copy()
@@ -198,9 +217,10 @@ def load_and_freeze_obs_rms(
         data["count"].copy()
     )
 
-    # --------------------------------------------------------
-    # Freeze running statistics during evaluation
-    # --------------------------------------------------------
+
+    # ========================================================
+    # Freeze stats during evaluation
+    # ========================================================
 
     if hasattr(
         norm_w,
@@ -211,18 +231,17 @@ def load_and_freeze_obs_rms(
 
     else:
 
-        # Fallback for versions where the wrapper
-        # has no explicit freeze flag.
         norm_w.obs_rms.update = (
             lambda x: None
         )
 
+
     print(
-        "Loaded obs_rms:"
+        "\nLoaded training observation normalization:"
     )
 
     print(
-        "  mean =",
+        "mean:",
         np.round(
             data["mean"],
             4,
@@ -230,7 +249,7 @@ def load_and_freeze_obs_rms(
     )
 
     print(
-        "  var  =",
+        "var:",
         np.round(
             data["var"],
             4,
@@ -238,7 +257,7 @@ def load_and_freeze_obs_rms(
     )
 
     print(
-        "  count =",
+        "count:",
         float(
             np.asarray(
                 data["count"]
@@ -258,15 +277,8 @@ def load_and_freeze_obs_rms(
 def evaluate(
     model_path,
     obs_rms_path,
-    env_id=ENV_ID,
-    n_episodes=N_EPISODES,
-    deterministic=DETERMINISTIC,
-    seed=SEED,
-    render=RENDER,
-    sleep=STEP_SLEEP,
-    pause_between_episodes=PAUSE_BETWEEN_EPISODES,
-    debug=DEBUG,
 ):
+
 
     print(
         "=" * 72
@@ -281,37 +293,39 @@ def evaluate(
     )
 
     print(
-        f"Environment:         {env_id}"
+        f"Environment:        {ENV_ID}"
     )
 
     print(
-        f"Reward type:         {REWARD_TYPE}"
+        f"Reward:             {REWARD_TYPE}"
     )
 
     print(
-        f"Control type:        {CONTROL_TYPE}"
+        f"Control:            {CONTROL_TYPE}"
     )
 
     print(
-        f"Success threshold:   "
+        f"Success threshold:  "
         f"{DISTANCE_THRESHOLD * 100:.1f} cm"
     )
 
     print(
-        f"Model:               {model_path}"
+        f"Episodes:           {N_EPISODES}"
     )
 
     print(
-        f"Observation stats:   {obs_rms_path}"
+        f"Deterministic:      {DETERMINISTIC}"
     )
 
     print(
-        f"Episodes:            {n_episodes}"
+        f"Record video:       {RECORD_VIDEO}"
     )
 
-    print(
-        f"Deterministic:       {deterministic}"
-    )
+    if RECORD_VIDEO:
+
+        print(
+            f"Video folder:       {VIDEO_DIR}"
+        )
 
     print(
         "=" * 72
@@ -319,69 +333,60 @@ def evaluate(
 
 
     # ========================================================
-    # Create dummy env to reconstruct Agent dimensions
+    # Dummy vector env
+    #
+    # Needed only to reconstruct Agent dimensions
     # ========================================================
-
-    args = Args()
-
-    args.env_id = env_id
-
 
     dummy = gym.vector.SyncVectorEnv(
         [
-            make_env(
-                env_id,
-                0,
-                False,
-                "eval_dummy",
-                args.gamma,
+            lambda: build_env(
+                record_video=False,
+                show_live=False,
             )
         ]
     )
 
 
     print(
-        "\nNetwork dimensions:"
+        "\nNetwork:"
     )
 
     print(
-        "  observation space:",
+        "Observation space:",
         dummy.single_observation_space,
     )
 
     print(
-        "  action space:",
+        "Action space:",
         dummy.single_action_space,
     )
 
 
-    # --------------------------------------------------------
-    # Joint control should give 7D action space
-    # --------------------------------------------------------
+    # ========================================================
+    # Must be 7 joint actions
+    # ========================================================
 
     action_shape = (
         dummy.single_action_space.shape
     )
 
+
     if action_shape != (7,):
 
-        print(
-            "\nWARNING:"
-        )
-
-        print(
-            f"Expected joint-control action shape (7,), "
+        raise RuntimeError(
+            f"Expected joint action shape (7,), "
             f"but got {action_shape}."
         )
 
-        print(
-            "Check that make_env() uses "
-            "control_type='joints'."
-        )
+
+    print(
+        "Joint action dimension: 7 ✓"
+    )
 
 
     # ========================================================
-    # Reconstruct neural network
+    # Construct network
     # ========================================================
 
     agent = Agent(
@@ -390,7 +395,7 @@ def evaluate(
 
 
     # ========================================================
-    # Load trained policy
+    # Load policy
     # ========================================================
 
     state_dict = torch.load(
@@ -398,53 +403,35 @@ def evaluate(
         map_location="cpu",
     )
 
+
     agent.load_state_dict(
         state_dict
     )
 
+
     agent.eval()
+
 
     dummy.close()
 
 
     print(
-        "\nModel loaded successfully."
+        "Model loaded successfully."
     )
 
 
     # ========================================================
-    # Create evaluation environment
+    # Evaluation environment
     # ========================================================
 
-    if render:
-
-        env = make_render_env(
-            env_id
-        )
-
-    else:
-
-        env = make_env(
-            env_id,
-            0,
-            False,
-            "eval",
-            args.gamma,
-        )()
-
-
-        # Very important:
-        # make_env must also have threshold=0.02.
-        #
-        # This line makes evaluation robust even if you
-        # accidentally forgot it inside make_env().
-        env.unwrapped.task.distance_threshold = (
-            DISTANCE_THRESHOLD
-        )
+    env = build_env(
+        record_video=RECORD_VIDEO,
+        show_live=SHOW_LIVE,
+    )
 
 
     # ========================================================
-    # Restore normalization statistics
+    # Restore training normalization
     # ========================================================
 
     load_and_freeze_obs_rms(
@@ -454,76 +441,73 @@ def evaluate(
 
 
     # ========================================================
-    # Debug task / robot
+    # Sanity check
     # ========================================================
 
-    if debug:
+    base = env.unwrapped
 
-        base = env.unwrapped
 
-        print(
-            "\n--- Environment check ---"
-        )
+    print(
+        "\nEnvironment check:"
+    )
 
-        print(
-            "distance_threshold =",
-            base.task.distance_threshold,
-        )
+    print(
+        "distance_threshold =",
+        base.task.distance_threshold,
+    )
 
-        print(
-            "control_type =",
-            getattr(
-                base.robot,
-                "control_type",
-                "unknown",
-            ),
-        )
+    print(
+        "control_type =",
+        getattr(
+            base.robot,
+            "control_type",
+            "unknown",
+        ),
+    )
 
-        print(
-            "goal range low =",
-            getattr(
-                base.task,
-                "goal_range_low",
-                None,
-            ),
-        )
+    print(
+        "goal_range_low =",
+        base.task.goal_range_low,
+    )
 
-        print(
-            "goal range high =",
-            getattr(
-                base.task,
-                "goal_range_high",
-                None,
-            ),
-        )
-
-        print()
+    print(
+        "goal_range_high =",
+        base.task.goal_range_high,
+    )
 
 
     # ========================================================
-    # Storage
+    # Results
     # ========================================================
 
     successes = []
 
     returns = []
 
+    initial_distances = []
+
     final_distances = []
+
+    minimum_distances = []
 
     episode_steps = []
 
+    rows = []
+
 
     # ========================================================
-    # Evaluation loop
+    # Episode loop
     # ========================================================
 
     for ep in range(
-        n_episodes
+        N_EPISODES
     ):
 
+
         obs, info = env.reset(
-            seed=seed + ep
+            seed=SEED + ep
         )
+
 
         done = False
 
@@ -534,27 +518,34 @@ def evaluate(
         n_step = 0
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # Initial state
-        # ----------------------------------------------------
+        # ====================================================
 
         base = env.unwrapped
 
-        initial_goal = np.asarray(
+
+        goal = np.asarray(
             base.task.get_goal(),
             dtype=np.float32,
         )
+
 
         initial_ee = np.asarray(
             base.task.get_achieved_goal(),
             dtype=np.float32,
         )
 
+
         initial_distance = float(
             np.linalg.norm(
-                initial_ee
-                - initial_goal
+                initial_ee - goal
             )
+        )
+
+
+        min_distance = (
+            initial_distance
         )
 
 
@@ -563,17 +554,23 @@ def evaluate(
         )
 
         print(
-            f"Episode {ep + 1}/{n_episodes}"
+            f"Episode {ep + 1}/{N_EPISODES}"
         )
 
         print(
-            f"Initial EE:    "
-            f"{np.round(initial_ee, 3)}"
+            "Initial EE:",
+            np.round(
+                initial_ee,
+                3,
+            ),
         )
 
         print(
-            f"Goal:          "
-            f"{np.round(initial_goal, 3)}"
+            "Goal:",
+            np.round(
+                goal,
+                3,
+            ),
         )
 
         print(
@@ -583,10 +580,11 @@ def evaluate(
 
 
         # ====================================================
-        # Episode interaction loop
+        # Interaction loop
         # ====================================================
 
         while not done:
+
 
             # ------------------------------------------------
             # Policy inference
@@ -594,13 +592,14 @@ def evaluate(
 
             with torch.no_grad():
 
+
                 x = torch.tensor(
                     obs,
                     dtype=torch.float32,
                 ).unsqueeze(0)
 
 
-                if deterministic:
+                if DETERMINISTIC:
 
                     action = (
                         agent.actor_mean(x)
@@ -623,26 +622,27 @@ def evaluate(
 
 
             # ------------------------------------------------
-            # Debug joint action
+            # Debug
             # ------------------------------------------------
 
             if (
-                debug
+                DEBUG
                 and n_step % 10 == 0
             ):
 
-                clipped_action = np.clip(
+                clipped = np.clip(
                     raw_action,
                     -1.0,
                     1.0,
                 )
+
 
                 print(
                     f"\nAction step {n_step:3d}"
                 )
 
                 print(
-                    "  raw joint action:",
+                    "raw:",
                     np.round(
                         raw_action,
                         3,
@@ -650,16 +650,16 @@ def evaluate(
                 )
 
                 print(
-                    "  clipped action:",
+                    "clip:",
                     np.round(
-                        clipped_action,
+                        clipped,
                         3,
                     ),
                 )
 
 
             # ------------------------------------------------
-            # Environment step
+            # Step environment
             # ------------------------------------------------
 
             obs, reward, terminated, truncated, info = (
@@ -673,12 +673,50 @@ def evaluate(
                 reward
             )
 
+
             n_step += 1
 
 
-            # ------------------------------------------------
+            # =================================================
+            # Current distance
+            # =================================================
+
+            base = env.unwrapped
+
+
+            current_goal = np.asarray(
+                base.task.get_goal(),
+                dtype=np.float32,
+            )
+
+
+            current_ee = np.asarray(
+                base.task.get_achieved_goal(),
+                dtype=np.float32,
+            )
+
+
+            current_distance = float(
+                np.linalg.norm(
+                    current_ee
+                    - current_goal
+                )
+            )
+
+
+            # =================================================
+            # Minimum distance reached
+            # =================================================
+
+            min_distance = min(
+                min_distance,
+                current_distance,
+            )
+
+
+            # =================================================
             # Success
-            # ------------------------------------------------
+            # =================================================
 
             if bool(
                 info.get(
@@ -690,84 +728,32 @@ def evaluate(
                 ever_success = True
 
 
-            # ------------------------------------------------
-            # Position debugging
-            # ------------------------------------------------
+            # =================================================
+            # Debug position
+            # =================================================
 
             if (
-                debug
+                DEBUG
                 and n_step % 10 == 0
             ):
 
-                base = env.unwrapped
-
-
-                goal = np.asarray(
-                    base.task.get_goal(),
-                    dtype=np.float32,
-                )
-
-                achieved = np.asarray(
-                    base.task.get_achieved_goal(),
-                    dtype=np.float32,
-                )
-
-                distance = float(
-                    np.linalg.norm(
-                        achieved
-                        - goal
-                    )
-                )
-
-
-                try:
-
-                    ee = np.asarray(
-                        base.robot.get_ee_position(),
-                        dtype=np.float32,
-                    )
-
-                except Exception:
-
-                    ee = achieved
-
-
                 print(
-                    f"  step {n_step:3d}"
-                )
-
-                print(
-                    f"  goal:     "
-                    f"{np.round(goal, 3)}"
-                )
-
-                print(
-                    f"  achieved: "
-                    f"{np.round(achieved, 3)}"
-                )
-
-                print(
-                    f"  EE:       "
-                    f"{np.round(ee, 3)}"
-                )
-
-                print(
-                    f"  distance: "
-                    f"{distance * 100:.2f} cm"
+                    f"step {n_step:3d}: "
+                    f"EE={np.round(current_ee, 3)} "
+                    f"goal={np.round(current_goal, 3)} "
+                    f"error={current_distance * 100:.2f} cm "
+                    f"min={min_distance * 100:.2f} cm"
                 )
 
 
             # ------------------------------------------------
-            # Render delay
+            # Optional delay
             # ------------------------------------------------
 
-            if (
-                render
-                and sleep > 0
-            ):
+            if STEP_SLEEP > 0:
 
                 time.sleep(
-                    sleep
+                    STEP_SLEEP
                 )
 
 
@@ -778,46 +764,35 @@ def evaluate(
 
 
         # ====================================================
-        # End-of-episode metrics
+        # Final state
         # ====================================================
 
         base = env.unwrapped
 
 
-        goal = np.asarray(
+        final_goal = np.asarray(
             base.task.get_goal(),
             dtype=np.float32,
         )
 
-        achieved = np.asarray(
+
+        final_ee = np.asarray(
             base.task.get_achieved_goal(),
             dtype=np.float32,
         )
 
 
-        try:
-
-            ee = np.asarray(
-                base.robot.get_ee_position(),
-                dtype=np.float32,
-            )
-
-        except Exception:
-
-            ee = achieved
-
-
         final_distance = float(
             np.linalg.norm(
-                achieved
-                - goal
+                final_ee
+                - final_goal
             )
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # Save metrics
-        # ----------------------------------------------------
+        # ====================================================
 
         successes.append(
             float(
@@ -825,124 +800,180 @@ def evaluate(
             )
         )
 
+
         returns.append(
-            float(
-                ep_ret
-            )
+            ep_ret
         )
+
+
+        initial_distances.append(
+            initial_distance
+        )
+
 
         final_distances.append(
             final_distance
         )
+
+
+        minimum_distances.append(
+            min_distance
+        )
+
 
         episode_steps.append(
             n_step
         )
 
 
-        # ----------------------------------------------------
-        # Episode output
-        # ----------------------------------------------------
+        rows.append(
+            {
+                "episode": ep + 1,
+
+                "success":
+                    int(ever_success),
+
+                "initial_distance_cm":
+                    initial_distance * 100,
+
+                "final_distance_cm":
+                    final_distance * 100,
+
+                "minimum_distance_cm":
+                    min_distance * 100,
+
+                "return":
+                    ep_ret,
+
+                "steps":
+                    n_step,
+            }
+        )
+
+
+        # ====================================================
+        # Episode result
+        # ====================================================
 
         print(
             "\nEpisode result:"
         )
 
+
         print(
-            f"  success:     "
+            f"success:       "
             f"{ever_success}"
         )
 
+
         print(
-            f"  return:      "
+            f"return:        "
             f"{ep_ret:.3f}"
         )
 
+
         print(
-            f"  steps:       "
+            f"steps:         "
             f"{n_step}"
         )
 
-        print(
-            f"  goal:        "
-            f"{np.round(goal, 3)}"
-        )
 
         print(
-            f"  final EE:    "
-            f"{np.round(ee, 3)}"
+            f"initial error: "
+            f"{initial_distance * 100:.2f} cm"
         )
 
+
         print(
-            f"  final error: "
+            f"final error:   "
             f"{final_distance * 100:.2f} cm"
         )
 
 
-        if pause_between_episodes:
-
-            input(
-                "\nPress Enter for next episode..."
-            )
+        print(
+            f"minimum error: "
+            f"{min_distance * 100:.2f} cm"
+        )
 
 
     # ========================================================
-    # Close env
+    # Closing env finalises MP4 videos
     # ========================================================
 
     env.close()
 
 
     # ========================================================
-    # Summary statistics
+    # Save CSV
     # ========================================================
 
-    success_rate = float(
-        np.mean(
-            successes
-        )
-        * 100.0
+    os.makedirs(
+        os.path.dirname(
+            RESULT_CSV
+        ),
+        exist_ok=True,
     )
 
-    mean_return = float(
-        np.mean(
-            returns
-        )
-    )
 
-    mean_distance = float(
-        np.mean(
-            final_distances
-        )
-    )
+    with open(
+        RESULT_CSV,
+        "w",
+        newline="",
+    ) as f:
 
-    median_distance = float(
-        np.median(
-            final_distances
+        writer = csv.DictWriter(
+            f,
+            fieldnames=rows[0].keys(),
         )
-    )
 
-    std_distance = float(
-        np.std(
-            final_distances
-        )
-    )
+        writer.writeheader()
 
-    mean_steps = float(
-        np.mean(
-            episode_steps
+        writer.writerows(
+            rows
         )
-    )
-
-    median_steps = float(
-        np.median(
-            episode_steps
-        )
-    )
 
 
     # ========================================================
-    # Final output
+    # Convert metrics to arrays
+    # ========================================================
+
+    successes = np.asarray(
+        successes
+    )
+
+    returns = np.asarray(
+        returns
+    )
+
+    initial_distances = np.asarray(
+        initial_distances
+    )
+
+    final_distances = np.asarray(
+        final_distances
+    )
+
+    minimum_distances = np.asarray(
+        minimum_distances
+    )
+
+    episode_steps = np.asarray(
+        episode_steps
+    )
+
+
+    # ========================================================
+    # Statistics
+    # ========================================================
+
+    success_rate = (
+        np.mean(successes)
+        * 100
+    )
+
+
+    # ========================================================
+    # Final report
     # ========================================================
 
     print(
@@ -957,72 +988,101 @@ def evaluate(
         "=" * 72
     )
 
-    print(
-        f"Control type:             "
-        f"{CONTROL_TYPE}"
-    )
 
     print(
-        f"Success threshold:        "
+        f"Episodes:                  "
+        f"{N_EPISODES}"
+    )
+
+
+    print(
+        f"Success threshold:         "
         f"{DISTANCE_THRESHOLD * 100:.1f} cm"
     )
 
+
     print(
-        f"Success rate:             "
+        f"Success rate:              "
         f"{success_rate:.1f}% "
-        f"({int(sum(successes))}/{n_episodes})"
+        f"({int(successes.sum())}/{N_EPISODES})"
     )
 
-    print(
-        f"Mean episode return:      "
-        f"{mean_return:.3f}"
-    )
 
     print(
-        f"Mean final EE-goal error: "
-        f"{mean_distance * 100:.2f} cm"
+        f"Mean initial error:        "
+        f"{initial_distances.mean() * 100:.2f} cm"
     )
 
-    print(
-        f"Median final error:       "
-        f"{median_distance * 100:.2f} cm"
-    )
 
     print(
-        f"Std final error:          "
-        f"{std_distance * 100:.2f} cm"
+        f"Mean final error:          "
+        f"{final_distances.mean() * 100:.2f} cm"
     )
 
-    print(
-        f"Mean episode steps:       "
-        f"{mean_steps:.1f}"
-    )
 
     print(
-        f"Median episode steps:     "
-        f"{median_steps:.1f}"
+        f"Median final error:        "
+        f"{np.median(final_distances) * 100:.2f} cm"
     )
+
+
+    print(
+        f"Mean minimum error:        "
+        f"{minimum_distances.mean() * 100:.2f} cm"
+    )
+
+
+    print(
+        f"Median minimum error:      "
+        f"{np.median(minimum_distances) * 100:.2f} cm"
+    )
+
+
+    print(
+        f"Best minimum error:        "
+        f"{minimum_distances.min() * 100:.2f} cm"
+    )
+
+
+    print(
+        f"Std final error:           "
+        f"{final_distances.std() * 100:.2f} cm"
+    )
+
+
+    print(
+        f"Mean episode return:       "
+        f"{returns.mean():.3f}"
+    )
+
+
+    print(
+        f"Mean episode steps:        "
+        f"{episode_steps.mean():.1f}"
+    )
+
+
+    print(
+        f"Median episode steps:      "
+        f"{np.median(episode_steps):.1f}"
+    )
+
 
     print(
         "=" * 72
     )
 
 
-    return {
-        "success_rate": success_rate,
-        "mean_return": mean_return,
-        "mean_final_distance_cm": (
-            mean_distance * 100
-        ),
-        "median_final_distance_cm": (
-            median_distance * 100
-        ),
-        "std_final_distance_cm": (
-            std_distance * 100
-        ),
-        "mean_steps": mean_steps,
-        "median_steps": median_steps,
-    }
+    print(
+        f"\nResults CSV:\n{RESULT_CSV}"
+    )
+
+
+    if RECORD_VIDEO:
+
+        print(
+            f"\nVideos saved to:\n{VIDEO_DIR}"
+        )
 
 
 # ============================================================
@@ -1031,28 +1091,23 @@ def evaluate(
 
 if __name__ == "__main__":
 
-    # --------------------------------------------------------
-    # CHANGE THIS after your new 2 cm joint-control run
-    # --------------------------------------------------------
 
     RUN = os.path.join(
         ROOT,
-        "training",
-        "cleanrl",
         "runs",
-        "PandaReach-v3__ppo_cont_2__1__XXXXXXXXXX",
+        "PandaReach-v3__ppo_continuous_action__1__1789070756",
     )
 
 
     model_path = os.path.join(
         RUN,
-        "ppo_cont_2.cleanrl_model",
+        "ppo_continuous_action.cleanrl_model",
     )
 
 
     obs_rms_path = os.path.join(
         RUN,
-        "ppo_cont_2.obs_rms.npz",
+        "ppo_continuous_action.obs_rms.npz",
     )
 
 
@@ -1082,13 +1137,6 @@ if __name__ == "__main__":
 
 
     evaluate(
-        model_path=model_path,
-        obs_rms_path=obs_rms_path,
-        env_id=ENV_ID,
-        n_episodes=N_EPISODES,
-        deterministic=DETERMINISTIC,
-        render=RENDER,
-        sleep=STEP_SLEEP,
-        pause_between_episodes=PAUSE_BETWEEN_EPISODES,
-        debug=DEBUG,
+        model_path,
+        obs_rms_path,
     )
