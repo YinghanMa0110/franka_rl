@@ -1,47 +1,141 @@
 """
-PPO Training Script for Franka Panda
-Trains a PPO policy on PandaReach using panda-gym and Stable Baselines3.
+Policy Validation Script
+Test the same SB3 PandaReach checkpoint used on the real Franka.
 """
 
+import time
 import gymnasium as gym
 import panda_gym
+import numpy as np
+
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+
 
 # ============ Configuration ============
-ENV_NAME = 'PandaReach-v3'
-REWARD_TYPE = 'dense'
-TOTAL_TIMESTEPS = 3_000_000
-CHECKPOINT_FREQ = 10_000
-CHECKPOINT_DIR = '../checkpoints/'
-CHECKPOINT_PREFIX = 'panda_reach_ppo'
-FINAL_SAVE_PATH = '../checkpoints/panda_reach_final'
 
-# ============ Create Environment ============
-env = gym.make(ENV_NAME, reward_type=REWARD_TYPE)
+CHECKPOINT_PATH = "checkpoints/panda_reach_ppo_40000_steps"
 
-# Print environment info
-print(f"Environment: {ENV_NAME}")
-print(f"Observation space: {env.observation_space}")
-print(f"Action space: {env.action_space}")
-print(f"Reward type: {REWARD_TYPE}")
+ENV_NAME = "PandaReach-v3"
+REWARD_TYPE = "dense"
 
-# ============ Create Model ============
-# MultiInputPolicy is required because panda-gym uses dict observations
-model = PPO('MultiInputPolicy', env, verbose=1)
+NUM_EPISODES = 20
 
-# ============ Setup Checkpoint Callback ============
-# Auto-saves every CHECKPOINT_FREQ steps to prevent losing progress
-checkpoint_callback = CheckpointCallback(
-    save_freq=CHECKPOINT_FREQ,
-    save_path=CHECKPOINT_DIR,
-    name_prefix=CHECKPOINT_PREFIX
+RENDER = True
+STEP_DELAY = 0.05
+
+
+# ============ Load Model ============
+
+print(f"Loading checkpoint: {CHECKPOINT_PATH}")
+
+model = PPO.load(
+    CHECKPOINT_PATH
 )
 
-# ============ Train ============
-print(f"\nStarting training for {TOTAL_TIMESTEPS} timesteps...")
-model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=checkpoint_callback)
+print("Checkpoint loaded!")
 
-# ============ Save Final Model ============
-model.save(FINAL_SAVE_PATH)
-print(f"\nTraining complete! Final model saved to {FINAL_SAVE_PATH}")
+
+# ============ Create Environment ============
+
+render_mode = "human" if RENDER else None
+
+env = gym.make(
+    ENV_NAME,
+    reward_type=REWARD_TYPE,
+    render_mode=render_mode
+)
+
+
+# ============ Test ============
+
+successes = 0
+final_distances = []
+
+
+for i in range(NUM_EPISODES):
+
+    obs, info = env.reset(
+        seed=i
+    )
+
+    done = False
+    total_reward = 0.0
+    step = 0
+
+    while not done:
+
+        action, _ = model.predict(
+            obs,
+            deterministic=True
+        )
+
+        obs, reward, terminated, truncated, info = env.step(
+            action
+        )
+
+        done = terminated or truncated
+
+        total_reward += reward
+        step += 1
+
+        if RENDER:
+            time.sleep(STEP_DELAY)
+
+    achieved = obs["achieved_goal"]
+    desired = obs["desired_goal"]
+
+    final_distance = np.linalg.norm(
+        achieved - desired
+    )
+
+    final_distances.append(
+        final_distance
+    )
+
+    success = bool(
+        info.get(
+            "is_success",
+            final_distance < 0.05
+        )
+    )
+
+    successes += int(success)
+
+    print(
+        f"Episode {i + 1}: "
+        f"reward={total_reward:.2f}, "
+        f"success={success}, "
+        f"final_error={final_distance * 100:.2f} cm, "
+        f"steps={step}"
+    )
+
+
+# ============ Summary ============
+
+success_rate = (
+    successes
+    / NUM_EPISODES
+    * 100
+)
+
+mean_error = (
+    np.mean(final_distances)
+    * 100
+)
+
+print("\n" + "=" * 60)
+
+print(
+    f"Results: "
+    f"{successes}/{NUM_EPISODES} successful "
+    f"({success_rate:.1f}%)"
+)
+
+print(
+    f"Mean final error: "
+    f"{mean_error:.2f} cm"
+)
+
+print("=" * 60)
+
+env.close()
