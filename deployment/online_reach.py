@@ -1,17 +1,3 @@
-"""
-Franka RL Online Fine-tuning - Cartesian Impedance Controller
-
-把 benchmark/deploy 脚本改成 online trainer：真机包成 gym.Env，
-warm-start sim checkpoint，用 model.learn() 在真机上继续训 PPO，
-闭合 sim-to-real 的 ~6cm gap。
-
-- 复用 deploy 脚本的 config / panda-py 调用 / obs builder / stiffness=900
-- reward = -distance（dense，真机 base frame）
-- 每 episode 记 final_distance / success 到 CSV -> 训练曲线（组会用）
-
-评估仍用原 benchmark 脚本：fine-tune 前后各跑一遍，比 final_distance。
-"""
-
 import os
 import csv
 import time
@@ -37,26 +23,26 @@ logging.basicConfig(level=logging.INFO)
 HOSTNAME        = "192.168.1.8"
 CHECKPOINT_PATH = "checkpoints/panda_reach_ppo_40000_steps"   # 真机验证过的 SB3 checkpoint
 
-BASE_OFFSET = np.array([-0.6, 0.0, 0.0])   # panda-gym world <- real base，仅 obs 用
+BASE_OFFSET = np.array([-1, 0.0, 0.0])   # panda-gym world <- real base，仅 obs 用
 
 ACTION_SCALE   = 0.05
-MAX_STEP       = 0.03     # 单步 3D 位移上限 (m)
+MAX_STEP       = 0.02    # 单步 3D 位移上限 (m)
 CONTROL_FREQ   = 20       # Hz
 GOAL_THRESHOLD = 0.05     # 成功阈值 (m)
 
-TRANSLATIONAL_STIFFNESS = 900.0
+TRANSLATIONAL_STIFFNESS = 600.0
 ROTATIONAL_STIFFNESS    = 30.0
 
 # ---- 安全：workspace 硬边界（deploy 脚本没有，训练探索必须加！按 lab 实际范围收紧）----
-WORKSPACE_LOW  = np.array([0.25, -0.25, 0.10])
+WORKSPACE_LOW  = np.array([0.25, -0.25, 0])
 WORKSPACE_HIGH = np.array([0.65,  0.25, 0.60])
 
 # ---- 训练 goal 采样范围（真机 base frame，相对 start EE，匹配 benchmark 的 ±0.08）----
-GOAL_LOW  = np.array([-0.08, -0.08, -0.08])
-GOAL_HIGH = np.array([ 0.08,  0.08,  0.08])
+GOAL_LOW  = np.array([-0.20, -0.20, -0.20])
+GOAL_HIGH = np.array([ 0.20,  0.20,  0.20])
 
 # ---- fine-tune 超参（比 sim 保守）----
-TOTAL_TIMESTEPS = 300     # 第一次务必先设 300 试跑，确认闭环再放大到几千
+TOTAL_TIMESTEPS = 3000    # 第一次务必先设 300 试跑，确认闭环再放大到几千
 LEARNING_RATE   = 1e-4
 N_STEPS         = 200     # 一次 update 前收集步数（4 episodes）
 BATCH_SIZE      = 50
@@ -102,9 +88,9 @@ class FrankaReachOnlineEnv(gym.Env):
 
         self.action_space = spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
         self.observation_space = spaces.Dict({
-            "observation":   spaces.Box(-np.inf, np.inf, shape=(6,), dtype=np.float32),
-            "achieved_goal": spaces.Box(-np.inf, np.inf, shape=(3,), dtype=np.float32),
-            "desired_goal":  spaces.Box(-np.inf, np.inf, shape=(3,), dtype=np.float32),
+            "observation":   spaces.Box(-10.0, 10.0, shape=(6,), dtype=np.float32),
+            "achieved_goal": spaces.Box(-10.0, 10.0, shape=(3,), dtype=np.float32),
+            "desired_goal":  spaces.Box(-10.0, 10.0, shape=(3,), dtype=np.float32),
         })
 
         self.q0 = None
