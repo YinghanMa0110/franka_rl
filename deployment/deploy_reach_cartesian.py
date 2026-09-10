@@ -126,41 +126,53 @@ def main():
         ) as ctx:
             while ctx.ok():
                 # Read current position
-                current_pos = panda.get_position()
+                current_ee = panda.get_position()
+
+                # Goal and task error
+                goal = target_real.copy()
+                error = goal - current_ee
+                distance = np.linalg.norm(error)
 
                 # Estimate velocity (finite difference)
-                current_vel = (current_pos - prev_pos) * CONTROL_FREQ
-                prev_pos = current_pos.copy()
+                current_vel = (current_ee - prev_pos) * CONTROL_FREQ
+                prev_pos = current_ee.copy()
 
                 # Build observation
-                obs = build_obs(current_pos, current_vel, target_real)
+                obs = build_obs(current_ee, current_vel, target_real)
 
                 # Policy inference (outputs displacement in [-1, 1])
                 raw_action, _ = model.predict(obs, deterministic=True)
+                action = raw_action.copy()
 
                 # Scale action to real displacement
-                displacement = raw_action * ACTION_SCALE
+                action = action * ACTION_SCALE
 
                 # Safety: limit step size
-                displacement = np.clip(displacement, -MAX_STEP, MAX_STEP)
+                action = np.clip(action, -MAX_STEP, MAX_STEP)
 
-                # Compute new target position
-                x_d = current_pos + displacement
+                # Compute target position for the controller
+                target_position = current_ee + action
 
                 # Send control (unless dry run)
                 if not DRY_RUN:
-                    ctrl.set_control(x_d, q0)
+                    ctrl.set_control(target_position, q0)
 
-                # Check goal
-                dist = np.linalg.norm(current_pos - target_real)
                 step_count += 1
 
-                if step_count % CONTROL_FREQ == 0:  # print once per second
-                    print(f"Step {step_count}: pos={current_pos.round(3)} "
-                          f"action={raw_action.round(3)} dist={dist*100:.3f}cm")
+                if step_count % CONTROL_FREQ == 0:
+                    print("\n" + "-" * 50)
+                    print(f"Step {step_count}")
+                    print(f"  EE position:    {current_ee.round(4)}")
+                    print(f"  Goal:           {target_real.round(4)}")
+                    print(f"  Error xyz:      {error.round(4)}")
+                    print(f"  Distance:       {distance * 100:.2f} cm")
+                    print(f"  Velocity:       {current_vel.round(4)}")
+                    print(f"  Raw PPO action: {raw_action.round(4)}")
+                    print(f"  Command delta:  {action.round(4)}")
+                    print(f"  Ctrl target:    {target_position.round(4)}")  
 
-                if dist < GOAL_THRESHOLD:
-                    print(f"\nGoal reached! Final distance: {dist*100:.3f}cm")
+                if distance < GOAL_THRESHOLD:
+                    print(f"\nGoal reached! Final distance: {distance*100:.3f}cm")
                     break
 
     except KeyboardInterrupt:

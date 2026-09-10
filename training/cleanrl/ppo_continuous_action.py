@@ -51,7 +51,7 @@ class Args:
     """the number of parallel game environments"""
     num_steps: int = 2048
     """the number of steps to run in each environment per policy rollout"""
-    anneal_lr: bool = True
+    anneal_lr: bool = False
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
     """the discount factor gamma"""
@@ -67,7 +67,7 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
+    ent_coef: float = 0.01
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
@@ -84,6 +84,24 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
+class PushShapedReward(gym.Wrapper):
+    """给 Push 任务加上 '末端到方块的距离' 引导项。
+
+    原始 reward = -(方块到目标的距离)，末端没碰到方块时是常数、梯度为零。
+    加这一项后，policy 在碰到方块之前也有信号引导它靠近。"""
+    def __init__(self, env, w_reach=0.5):
+        super().__init__(env)
+        self.w_reach = w_reach
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        base = self.env.unwrapped
+        ee = np.array(base.robot.get_ee_position())
+        obj = np.array(base.task.get_achieved_goal())
+        d_reach = np.linalg.norm(ee - obj)
+        reward = reward - self.w_reach * d_reach
+        return obs, reward, terminated, truncated, info
+
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
@@ -92,13 +110,15 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id,reward_type='dense')
-        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
+        if "Push" in env_id:
+            env = PushShapedReward(env, w_reach=0.5)
+        env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10),env.observation_space)
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+        # env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        # env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         return env
 
     return thunk
@@ -329,27 +349,37 @@ if __name__ == "__main__":
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.ppo_eval import evaluate
 
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=Agent,
-            device=device,
-            gamma=args.gamma,
+        # ===== 保存 observation 归一化统计量 =====
+        def find_wrapper(env, cls):
+            w = env
+            while isinstance(w, gym.Wrapper):
+                if isinstance(w, cls):
+                    return w
+                w = w.env
+            return None
+
+        norm_w = find_wrapper(envs.envs[0], gym.wrappers.NormalizeObservation)
+        assert norm_w is not None, "没找到 NormalizeObservation wrapper"
+
+        obs_rms_path = f"runs/{run_name}/{args.exp_name}.obs_rms.npz"
+        np.savez(
+            obs_rms_path,
+            mean=norm_w.obs_rms.mean,
+            var=norm_w.obs_rms.var,
+            count=norm_w.obs_rms.count,
         )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
+        print(f"obs_rms saved to {obs_rms_path}")
+        print(f"  mean={norm_w.obs_rms.mean}")
+        print(f"  var={norm_w.obs_rms.var}")
+        print(f"  count={norm_w.obs_rms.count}")
 
         if args.upload_model:
             from cleanrl_utils.huggingface import push_to_hub
 
             repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
+            push_to_hub(args, [], repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
 
     envs.close()
     writer.close()
