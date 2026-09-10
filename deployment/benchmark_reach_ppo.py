@@ -44,7 +44,7 @@ HOSTNAME = "192.168.1.8"
 CHECKPOINT_PATH = "checkpoints/panda_reach_ppo_40000_steps"
 
 
-# panda-gym base offset for coordinate conversion
+# panda-gym -> real robot coordinate offset
 BASE_OFFSET = np.array([
     -0.6,
     0.0,
@@ -58,16 +58,30 @@ BASE_OFFSET = np.array([
 
 ACTION_SCALE = 0.05
 
+# Maximum TOTAL 3D Cartesian command step
 MAX_STEP = 0.03
 
 CONTROL_FREQ = 20
 
 MAX_RUNTIME = 30
 
+# PandaReach success threshold
 GOAL_THRESHOLD = 0.05
 
 
-# Set True for policy inference without robot movement
+# ============================================================
+# Cartesian Impedance Parameters
+# ============================================================
+
+TRANSLATIONAL_STIFFNESS = 900.0
+
+ROTATIONAL_STIFFNESS = 30.0
+
+
+# ============================================================
+# Dry Run
+# ============================================================
+
 DRY_RUN = False
 
 
@@ -91,26 +105,24 @@ EPISODE_SUMMARY_FILE = os.path.join(
 # ============================================================
 # Fixed Benchmark Goals
 #
-# IMPORTANT:
-# Keep these EXACTLY the same when comparing:
-# PPO / SAC / TD3 / custom algorithms
+# All offsets are relative to move_to_start() EE position.
 #
-# Units: metres
-# Relative to move_to_start() EE position
+# IMPORTANT:
+# Use EXACTLY the same goals for every algorithm.
 # ============================================================
 
 GOAL_OFFSETS = np.array([
 
-    # ---------- X axis ----------
+    # ---------- X ----------
     [ 0.05,  0.00,  0.00],
     [ 0.08,  0.00,  0.00],
     [-0.05,  0.00,  0.00],
 
-    # ---------- Y axis ----------
+    # ---------- Y ----------
     [ 0.00,  0.05,  0.00],
     [ 0.00, -0.05,  0.00],
 
-    # ---------- Z axis ----------
+    # ---------- Z ----------
     [ 0.00,  0.00,  0.05],
     [ 0.00,  0.00, -0.05],
 
@@ -136,6 +148,15 @@ GOAL_OFFSETS = np.array([
     [ 0.08,  0.08, -0.08],
 
 ], dtype=np.float64)
+
+
+# ============================================================
+# For first test only:
+#
+# Uncomment this line to test only the first 3 goals.
+# ============================================================
+
+# GOAL_OFFSETS = GOAL_OFFSETS[:3]
 
 
 # ============================================================
@@ -213,7 +234,6 @@ def save_episode_summary(result):
         )
 
         if not file_exists:
-
             writer.writeheader()
 
         writer.writerow(
@@ -231,7 +251,6 @@ def save_step_log(
 ):
 
     if len(step_records) == 0:
-
         return
 
     os.makedirs(
@@ -358,6 +377,21 @@ def run_episode(
     )
 
 
+    # ========================================================
+    # Show Controller Parameters
+    # ========================================================
+
+    print(
+        f"Translational stiffness: "
+        f"{TRANSLATIONAL_STIFFNESS}"
+    )
+
+    print(
+        f"Rotational stiffness:    "
+        f"{ROTATIONAL_STIFFNESS}"
+    )
+
+
     if DRY_RUN:
 
         print(
@@ -365,7 +399,7 @@ def run_episode(
         )
 
         print(
-            "Robot will not receive "
+            "Robot will NOT receive "
             "movement commands."
         )
 
@@ -378,10 +412,48 @@ def run_episode(
 
 
     # ========================================================
-    # Controller
+    # Cartesian Impedance Controller
     # ========================================================
 
     ctrl = controllers.CartesianImpedance()
+
+
+    # --------------------------------------------------------
+    # Set Cartesian impedance
+    #
+    # [Kx, Ky, Kz, Krx, Kry, Krz]
+    # --------------------------------------------------------
+
+    ctrl.set_impedance(
+
+        np.diag([
+
+            TRANSLATIONAL_STIFFNESS,
+            TRANSLATIONAL_STIFFNESS,
+            TRANSLATIONAL_STIFFNESS,
+
+            ROTATIONAL_STIFFNESS,
+            ROTATIONAL_STIFFNESS,
+            ROTATIONAL_STIFFNESS
+
+        ])
+
+    )
+
+
+    print(
+        "\nController impedance:"
+    )
+
+    print(
+        f"  Translation: "
+        f"{TRANSLATIONAL_STIFFNESS}"
+    )
+
+    print(
+        f"  Rotation:    "
+        f"{ROTATIONAL_STIFFNESS}"
+    )
 
 
     if not DRY_RUN:
@@ -396,15 +468,17 @@ def run_episode(
     # ========================================================
 
     panda.enable_logging(
+
         int(
             CONTROL_FREQ
             * MAX_RUNTIME
         ) + 100
+
     )
 
 
     # ========================================================
-    # Metrics
+    # Episode Metrics
     # ========================================================
 
     step_count = 0
@@ -570,10 +644,10 @@ def run_episode(
 
 
                 # =================================================
-                # 3D Safety Norm Cap
+                # 3D Safety Norm Limit
                 #
-                # MAX_STEP represents total Cartesian displacement,
-                # not independent per-axis clipping.
+                # This limits total Cartesian displacement,
+                # rather than clipping each axis independently.
                 # =================================================
 
                 action_norm = (
@@ -601,7 +675,9 @@ def run_episode(
                 # Action Smoothness
                 # =================================================
 
-                action_change = np.nan
+                action_change = (
+                    np.nan
+                )
 
 
                 if (
@@ -665,7 +741,7 @@ def run_episode(
 
 
                 # =================================================
-                # Save Step Data
+                # Save Step-Level Data
                 # =================================================
 
                 step_records.append({
@@ -683,7 +759,7 @@ def run_episode(
                         elapsed_time,
 
 
-                    # Current EE
+                    # EE position
 
                     "ee_x":
                         current_ee[0],
@@ -746,7 +822,7 @@ def run_episode(
                         current_vel[2],
 
 
-                    # Raw PPO action
+                    # Raw PPO output
 
                     "raw_action_x":
                         raw_action[0],
@@ -769,9 +845,6 @@ def run_episode(
                     "action_z":
                         action[2],
 
-
-                    # Action metrics
-
                     "action_norm":
                         np.linalg.norm(
                             action
@@ -793,7 +866,7 @@ def run_episode(
                         target_position[2],
 
 
-                    # Trajectory metrics
+                    # Trajectory
 
                     "step_displacement_m":
                         step_displacement,
@@ -992,7 +1065,7 @@ def run_episode(
 
 
         # ====================================================
-        # Panda Log
+        # Panda Raw Log
         # ====================================================
 
         try:
@@ -1136,7 +1209,7 @@ def run_episode(
                 max_action_change,
 
 
-            # Evaluation configuration
+            # Controller / evaluation configuration
 
             "control_freq_hz":
                 CONTROL_FREQ,
@@ -1149,6 +1222,12 @@ def run_episode(
 
             "goal_threshold_cm":
                 GOAL_THRESHOLD * 100,
+
+            "translational_stiffness":
+                TRANSLATIONAL_STIFFNESS,
+
+            "rotational_stiffness":
+                ROTATIONAL_STIFFNESS,
 
             "dry_run":
                 DRY_RUN,
@@ -1256,6 +1335,16 @@ def run_episode(
             f"{max_action_change:.6f}"
         )
 
+        print(
+            f"Trans stiffness:      "
+            f"{TRANSLATIONAL_STIFFNESS}"
+        )
+
+        print(
+            f"Rot stiffness:        "
+            f"{ROTATIONAL_STIFFNESS}"
+        )
+
         print("=" * 60)
 
 
@@ -1268,10 +1357,6 @@ def run_episode(
 
 def main():
 
-
-    # ========================================================
-    # Create Result Directories
-    # ========================================================
 
     os.makedirs(
         RUN_DIR,
@@ -1329,44 +1414,56 @@ def main():
 
 
     # ========================================================
-    # Show Benchmark Settings
+    # Benchmark Configuration
     # ========================================================
 
-    print("\nBenchmark configuration:")
+    print(
+        "\nBenchmark configuration:"
+    )
 
 
     print(
-        f"  Episodes:       "
+        f"  Episodes:             "
         f"{len(GOAL_OFFSETS)}"
     )
 
     print(
-        f"  Control freq:   "
+        f"  Control freq:         "
         f"{CONTROL_FREQ} Hz"
     )
 
     print(
-        f"  Max runtime:    "
+        f"  Max runtime:          "
         f"{MAX_RUNTIME} s"
     )
 
     print(
-        f"  Action scale:   "
+        f"  Action scale:         "
         f"{ACTION_SCALE}"
     )
 
     print(
-        f"  Max step:       "
+        f"  Max step:             "
         f"{MAX_STEP * 100:.1f} cm"
     )
 
     print(
-        f"  Goal threshold: "
+        f"  Goal threshold:       "
         f"{GOAL_THRESHOLD * 100:.1f} cm"
     )
 
     print(
-        f"  DRY_RUN:        "
+        f"  Translation K:        "
+        f"{TRANSLATIONAL_STIFFNESS}"
+    )
+
+    print(
+        f"  Rotation K:           "
+        f"{ROTATIONAL_STIFFNESS}"
+    )
+
+    print(
+        f"  DRY_RUN:              "
         f"{DRY_RUN}"
     )
 
@@ -1379,15 +1476,18 @@ def main():
 
 
     # ========================================================
-    # Run All Fixed Goals
+    # Run Fixed Goals
     # ========================================================
 
     for (
         episode_id,
         goal_offset
     ) in enumerate(
+
         GOAL_OFFSETS,
+
         start=1
+
     ):
 
 
@@ -1416,8 +1516,7 @@ def main():
         )
 
 
-        # Stop entire benchmark
-        # if Ctrl+C was used
+        # Stop full benchmark after Ctrl+C
 
         if (
             result[
@@ -1437,7 +1536,10 @@ def main():
     # No Results
     # ========================================================
 
-    if len(results) == 0:
+    if (
+        len(results)
+        == 0
+    ):
 
         print(
             "No benchmark results."
@@ -1498,7 +1600,7 @@ def main():
 
 
     # ========================================================
-    # Final Benchmark Summary
+    # Overall Benchmark Summary
     # ========================================================
 
     print("\n")
@@ -1592,6 +1694,17 @@ def main():
         )
 
 
+    print(
+        f"Translation stiffness:   "
+        f"{TRANSLATIONAL_STIFFNESS}"
+    )
+
+    print(
+        f"Rotation stiffness:      "
+        f"{ROTATIONAL_STIFFNESS}"
+    )
+
+
     print("=" * 70)
 
 
@@ -1607,7 +1720,9 @@ def main():
     )
 
 
-    print("\nBenchmark finished.")
+    print(
+        "\nBenchmark finished."
+    )
 
 
 # ============================================================
