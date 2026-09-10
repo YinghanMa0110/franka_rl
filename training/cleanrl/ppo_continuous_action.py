@@ -109,7 +109,7 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
             env = gym.make(env_id, render_mode="rgb_array", reward_type='dense')
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id,reward_type='dense')
+            env = gym.make(env_id,reward_type='dense',control_type='joints')
         if "Push" in env_id:
             env = PushShapedReward(env, w_reach=0.5)
         env = gym.wrappers.FlattenObservation(env)
