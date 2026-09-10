@@ -1,22 +1,22 @@
 """
-Real Robot Reach Benchmark - PPO
+Franka RL Deployment Benchmark - Cartesian Impedance Controller
 
-Purpose:
-Evaluate a trained PandaReach PPO policy on the real Franka Panda
-using a fixed set of target positions.
+Deploys a PandaReach PPO policy on the real Franka using panda-py's
+CartesianImpedance controller.
 
-Metrics:
-- Success rate
-- Final error
-- Time to goal
-- Trajectory length
+Automatically records:
+- Success / failure
+- Final distance error
+- Episode steps
+- Episode runtime
+- EE trajectory length
+- Action smoothness
+- Step-level trajectory data
+- Panda raw log
 
-All algorithms should later use exactly the same:
-- goals
-- start pose
-- controller parameters
-- success threshold
-- runtime
+Designed for fair real-robot algorithm comparison:
+PPO / SAC / TD3 / custom algorithms should use the same
+goals, controller parameters, success threshold, and evaluation settings.
 """
 
 import os
@@ -28,7 +28,11 @@ from datetime import datetime
 import numpy as np
 import panda_py
 from panda_py import controllers
+
 from stable_baselines3 import PPO
+
+
+logging.basicConfig(level=logging.INFO)
 
 
 # ============================================================
@@ -39,577 +43,1577 @@ HOSTNAME = "192.168.1.8"
 
 CHECKPOINT_PATH = "checkpoints/panda_reach_ppo_40000_steps"
 
-BASE_OFFSET = np.array([-0.6, 0.0, 0.0])
 
-CONTROL_FREQ = 20.0
-DT = 1.0 / CONTROL_FREQ
+# panda-gym base offset for coordinate conversion
+BASE_OFFSET = np.array([
+    -0.6,
+    0.0,
+    0.0
+])
 
-MAX_RUNTIME = 30.0
 
-# Same definition as PandaReach
+# ============================================================
+# Deployment Parameters
+# ============================================================
+
+ACTION_SCALE = 0.05
+
+MAX_STEP = 0.03
+
+CONTROL_FREQ = 20
+
+MAX_RUNTIME = 30
+
 GOAL_THRESHOLD = 0.05
 
-# Keep these FIXED for algorithm comparison
-ACTION_SCALE = 0.03
-MAX_STEP = 0.02
 
-TRANSLATIONAL_STIFFNESS = 900.0
-ROTATIONAL_STIFFNESS = 30.0
-
+# Set True for policy inference without robot movement
 DRY_RUN = False
 
 
 # ============================================================
-# Fixed benchmark goals
+# Logging
+# ============================================================
+
+RESULT_DIR = "results"
+
+RUN_DIR = os.path.join(
+    RESULT_DIR,
+    "runs"
+)
+
+EPISODE_SUMMARY_FILE = os.path.join(
+    RESULT_DIR,
+    "episodes.csv"
+)
+
+
+# ============================================================
+# Fixed Benchmark Goals
 #
-# These are offsets relative to the robot start position.
 # IMPORTANT:
-# Use exactly the same list for PPO / SAC / TD3 / their algorithm.
+# Keep these EXACTLY the same when comparing:
+# PPO / SAC / TD3 / custom algorithms
+#
+# Units: metres
+# Relative to move_to_start() EE position
 # ============================================================
 
 GOAL_OFFSETS = np.array([
 
-    # x only
+    # ---------- X axis ----------
     [ 0.05,  0.00,  0.00],
     [ 0.08,  0.00,  0.00],
     [-0.05,  0.00,  0.00],
 
-    # y only
+    # ---------- Y axis ----------
     [ 0.00,  0.05,  0.00],
     [ 0.00, -0.05,  0.00],
 
-    # z only
+    # ---------- Z axis ----------
     [ 0.00,  0.00,  0.05],
     [ 0.00,  0.00, -0.05],
 
-    # xy
+    # ---------- XY ----------
     [ 0.05,  0.05,  0.00],
     [ 0.05, -0.05,  0.00],
     [-0.05,  0.05,  0.00],
     [-0.05, -0.05,  0.00],
 
-    # xz
+    # ---------- XZ ----------
     [ 0.05,  0.00,  0.05],
     [ 0.05,  0.00, -0.05],
     [-0.05,  0.00,  0.05],
     [-0.05,  0.00, -0.05],
 
-    # xyz
+    # ---------- XYZ ----------
     [ 0.05,  0.05,  0.05],
     [ 0.05,  0.05, -0.05],
     [ 0.05, -0.05,  0.05],
     [ 0.05, -0.05, -0.05],
 
-    # Previous-style larger target
+    # ---------- Larger diagonal ----------
     [ 0.08,  0.08, -0.08],
 
 ], dtype=np.float64)
 
 
 # ============================================================
-# Coordinate conversion
+# Coordinate Conversion
 # ============================================================
 
 def real_to_sim(real_pos):
+
+    """
+    Convert real Franka EE coordinates
+    to panda-gym coordinates.
+    """
+
     return real_pos + BASE_OFFSET
 
 
-def build_obs(current_pos_real, current_vel, target_real):
+# ============================================================
+# Observation Builder
+# ============================================================
 
-    current_sim = real_to_sim(current_pos_real)
-    target_sim = real_to_sim(target_real)
+def build_obs(
+    current_pos_real,
+    current_vel,
+    target_real
+):
 
-    obs = {
-        "observation": np.concatenate(
-            [current_sim, current_vel]
-        ).astype(np.float32),
+    current_sim = real_to_sim(
+        current_pos_real
+    )
+
+    target_sim = real_to_sim(
+        target_real
+    )
+
+    return {
+
+        "observation": np.concatenate([
+            current_sim,
+            current_vel
+        ]).astype(np.float32),
 
         "achieved_goal":
             current_sim.astype(np.float32),
 
         "desired_goal":
             target_sim.astype(np.float32),
-    }
 
-    return obs
+    }
 
 
 # ============================================================
-# Run one episode
+# Save Episode Summary
+# ============================================================
+
+def save_episode_summary(result):
+
+    os.makedirs(
+        RESULT_DIR,
+        exist_ok=True
+    )
+
+    file_exists = os.path.exists(
+        EPISODE_SUMMARY_FILE
+    )
+
+    with open(
+        EPISODE_SUMMARY_FILE,
+        "a",
+        newline=""
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=result.keys()
+        )
+
+        if not file_exists:
+
+            writer.writeheader()
+
+        writer.writerow(
+            result
+        )
+
+
+# ============================================================
+# Save Step Data
+# ============================================================
+
+def save_step_log(
+    step_records,
+    filename
+):
+
+    if len(step_records) == 0:
+
+        return
+
+    os.makedirs(
+        RUN_DIR,
+        exist_ok=True
+    )
+
+    with open(
+        filename,
+        "w",
+        newline=""
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=step_records[0].keys()
+        )
+
+        writer.writeheader()
+
+        writer.writerows(
+            step_records
+        )
+
+
+# ============================================================
+# Run One Episode
 # ============================================================
 
 def run_episode(
     panda,
     model,
-    episode_id,
     goal_offset,
+    episode_id
 ):
 
-    print("\n" + "=" * 70)
-    print(f"EPISODE {episode_id}")
+    run_id = (
+        datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+        + f"_ep{episode_id:02d}"
+    )
+
+
+    print("\n")
     print("=" * 70)
 
-    # --------------------------------------------------------
-    # Return to same start position
-    # --------------------------------------------------------
+    print(
+        f"EPISODE {episode_id}"
+    )
 
-    print("Moving robot to start position...")
+    print("=" * 70)
+
+
+    # ========================================================
+    # Reset Robot
+    # ========================================================
+
+    print(
+        "Moving robot to start..."
+    )
 
     panda.move_to_start()
 
     time.sleep(1.0)
 
-    start_pos = panda.get_position().copy()
-    start_orientation = panda.get_orientation().copy()
 
-    target_real = start_pos + goal_offset
+    x0 = panda.get_position().copy()
 
-    print(f"Start position : {start_pos}")
-    print(f"Goal offset    : {goal_offset}")
-    print(f"Target position: {target_real}")
+    q0 = panda.get_orientation().copy()
+
+
+    target_real = (
+        x0
+        + goal_offset
+    )
+
 
     initial_distance = np.linalg.norm(
-        target_real - start_pos
+        target_real - x0
+    )
+
+
+    print(
+        f"Start EE position: "
+        f"{x0.round(4)}"
     )
 
     print(
-        f"Initial distance: "
+        f"Goal offset:       "
+        f"{goal_offset.round(4)}"
+    )
+
+    print(
+        f"Target position:   "
+        f"{target_real.round(4)}"
+    )
+
+    print(
+        f"Initial distance:  "
         f"{initial_distance * 100:.2f} cm"
     )
 
-    input(
-        "\nCheck workspace + E-stop. "
-        "Press ENTER to start episode..."
+
+    # ========================================================
+    # PPO Sanity Check
+    # ========================================================
+
+    test_obs = build_obs(
+        x0,
+        np.zeros(3),
+        target_real
     )
 
-    if DRY_RUN:
-        print("DRY RUN - skipping movement.")
-        return None
+    test_action, _ = model.predict(
+        test_obs,
+        deterministic=True
+    )
 
-    # --------------------------------------------------------
+
+    print(
+        f"Initial PPO action: "
+        f"{test_action.round(4)}"
+    )
+
+
+    if DRY_RUN:
+
+        print(
+            "\nDRY_RUN enabled."
+        )
+
+        print(
+            "Robot will not receive "
+            "movement commands."
+        )
+
+
+    input(
+        "\nCheck robot workspace and E-stop. "
+        "Press ENTER to start episode "
+        "(Ctrl+C to stop benchmark): "
+    )
+
+
+    # ========================================================
     # Controller
-    # --------------------------------------------------------
+    # ========================================================
 
     ctrl = controllers.CartesianImpedance()
 
-    ctrl.set_impedance(
-        np.diag([
-            TRANSLATIONAL_STIFFNESS,
-            TRANSLATIONAL_STIFFNESS,
-            TRANSLATIONAL_STIFFNESS,
-            ROTATIONAL_STIFFNESS,
-            ROTATIONAL_STIFFNESS,
-            ROTATIONAL_STIFFNESS,
-        ])
+
+    if not DRY_RUN:
+
+        panda.start_controller(
+            ctrl
+        )
+
+
+    # ========================================================
+    # Panda Internal Logging
+    # ========================================================
+
+    panda.enable_logging(
+        int(
+            CONTROL_FREQ
+            * MAX_RUNTIME
+        ) + 100
     )
 
-    panda.start_controller(ctrl)
 
-    time.sleep(0.2)
+    # ========================================================
+    # Metrics
+    # ========================================================
 
-    # --------------------------------------------------------
-    # Episode variables
-    # --------------------------------------------------------
+    step_count = 0
 
-    start_time = time.time()
+    prev_pos = x0.copy()
 
-    prev_pos = panda.get_position().copy()
+    prev_action = None
 
     trajectory_length = 0.0
-    num_steps = 0
+
+    action_changes = []
+
+    step_records = []
+
 
     success = False
 
-    # --------------------------------------------------------
-    # Control loop
-    # --------------------------------------------------------
+    termination_reason = (
+        "unknown"
+    )
+
+
+    final_distance = (
+        initial_distance
+    )
+
+
+    start_time = (
+        time.perf_counter()
+    )
+
+
+    # ========================================================
+    # Control Loop
+    # ========================================================
 
     try:
 
-        while True:
+        with panda.create_context(
 
-            loop_start = time.time()
+            frequency=CONTROL_FREQ,
 
-            current_pos = panda.get_position().copy()
+            max_runtime=MAX_RUNTIME
 
-            error = target_real - current_pos
+        ) as ctx:
 
-            distance = np.linalg.norm(error)
 
-            elapsed = time.time() - start_time
+            while ctx.ok():
 
-            # --------------------------------------------
-            # Success
-            # --------------------------------------------
 
-            if distance < GOAL_THRESHOLD:
+                # =================================================
+                # Robot State
+                # =================================================
 
-                success = True
-
-                print(
-                    f"\nSUCCESS: "
-                    f"{distance * 100:.2f} cm"
+                current_ee = (
+                    panda.get_position().copy()
                 )
 
-                break
 
-            # --------------------------------------------
-            # Timeout
-            # --------------------------------------------
+                # =================================================
+                # Actual EE Movement
+                # =================================================
 
-            if elapsed > MAX_RUNTIME:
-
-                print(
-                    f"\nTIMEOUT: "
-                    f"{distance * 100:.2f} cm"
+                step_displacement = (
+                    np.linalg.norm(
+                        current_ee
+                        - prev_pos
+                    )
                 )
 
-                break
 
-            # --------------------------------------------
-            # Velocity estimate
-            # --------------------------------------------
+                trajectory_length += (
+                    step_displacement
+                )
 
-            current_vel = (
-                current_pos - prev_pos
-            ) * CONTROL_FREQ
 
-            # trajectory length
-            trajectory_length += np.linalg.norm(
-                current_pos - prev_pos
-            )
+                # =================================================
+                # Velocity Estimate
+                # =================================================
 
-            prev_pos = current_pos.copy()
+                current_vel = (
 
-            # --------------------------------------------
-            # Build PPO observation
-            # --------------------------------------------
+                    current_ee
+                    - prev_pos
 
-            obs = build_obs(
-                current_pos,
-                current_vel,
-                target_real,
-            )
+                ) * CONTROL_FREQ
 
-            raw_action, _ = model.predict(
-                obs,
-                deterministic=True,
-            )
 
-            raw_action = np.asarray(
-                raw_action,
-                dtype=np.float64,
-            )
+                prev_pos = (
+                    current_ee.copy()
+                )
 
-            # --------------------------------------------
-            # Scale action
-            # --------------------------------------------
 
-            action = raw_action * ACTION_SCALE
+                # =================================================
+                # Goal Error
+                # =================================================
 
-            norm = np.linalg.norm(action)
+                error = (
+                    target_real
+                    - current_ee
+                )
 
-            if norm > MAX_STEP:
+
+                distance = (
+                    np.linalg.norm(
+                        error
+                    )
+                )
+
+
+                final_distance = (
+                    distance
+                )
+
+
+                # =================================================
+                # PPO Observation
+                # =================================================
+
+                obs = build_obs(
+
+                    current_ee,
+
+                    current_vel,
+
+                    target_real
+
+                )
+
+
+                # =================================================
+                # PPO Inference
+                # =================================================
+
+                raw_action, _ = (
+                    model.predict(
+
+                        obs,
+
+                        deterministic=True
+
+                    )
+                )
+
+
+                raw_action = np.asarray(
+                    raw_action,
+                    dtype=np.float64
+                )
+
+
+                # =================================================
+                # Action Scaling
+                # =================================================
+
                 action = (
-                    action
-                    / norm
-                    * MAX_STEP
+
+                    raw_action.copy()
+
+                    * ACTION_SCALE
+
                 )
 
-            # Panda-gym style relative action
-            ctrl_target = (
-                current_pos + action
-            )
 
-            ctrl.set_control(
-                ctrl_target,
-                start_orientation,
-            )
+                # =================================================
+                # 3D Safety Norm Cap
+                #
+                # MAX_STEP represents total Cartesian displacement,
+                # not independent per-axis clipping.
+                # =================================================
 
-            num_steps += 1
-
-            # --------------------------------------------
-            # Debug print every 1 second
-            # --------------------------------------------
-
-            if num_steps % int(CONTROL_FREQ) == 0:
-
-                print(
-                    f"step={num_steps:4d} | "
-                    f"error={distance*100:5.2f} cm | "
-                    f"action={np.round(raw_action, 3)}"
+                action_norm = (
+                    np.linalg.norm(
+                        action
+                    )
                 )
 
-            # --------------------------------------------
-            # Maintain 20 Hz
-            # --------------------------------------------
 
-            loop_elapsed = time.time() - loop_start
+                if (
+                    action_norm
+                    > MAX_STEP
+                ):
 
-            sleep_time = DT - loop_elapsed
+                    action = (
 
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                        action
+                        / action_norm
+                        * MAX_STEP
+
+                    )
+
+
+                # =================================================
+                # Action Smoothness
+                # =================================================
+
+                action_change = np.nan
+
+
+                if (
+                    prev_action
+                    is not None
+                ):
+
+                    action_change = (
+                        np.linalg.norm(
+
+                            action
+                            - prev_action
+
+                        )
+                    )
+
+
+                    action_changes.append(
+                        action_change
+                    )
+
+
+                prev_action = (
+                    action.copy()
+                )
+
+
+                # =================================================
+                # Cartesian Controller Target
+                # =================================================
+
+                target_position = (
+
+                    current_ee
+                    + action
+
+                )
+
+
+                if not DRY_RUN:
+
+                    ctrl.set_control(
+
+                        target_position,
+
+                        q0
+
+                    )
+
+
+                step_count += 1
+
+
+                elapsed_time = (
+
+                    time.perf_counter()
+
+                    - start_time
+
+                )
+
+
+                # =================================================
+                # Save Step Data
+                # =================================================
+
+                step_records.append({
+
+                    "run_id":
+                        run_id,
+
+                    "episode":
+                        episode_id,
+
+                    "step":
+                        step_count,
+
+                    "time_sec":
+                        elapsed_time,
+
+
+                    # Current EE
+
+                    "ee_x":
+                        current_ee[0],
+
+                    "ee_y":
+                        current_ee[1],
+
+                    "ee_z":
+                        current_ee[2],
+
+
+                    # Goal offset
+
+                    "goal_offset_x":
+                        goal_offset[0],
+
+                    "goal_offset_y":
+                        goal_offset[1],
+
+                    "goal_offset_z":
+                        goal_offset[2],
+
+
+                    # Absolute goal
+
+                    "goal_x":
+                        target_real[0],
+
+                    "goal_y":
+                        target_real[1],
+
+                    "goal_z":
+                        target_real[2],
+
+
+                    # Error
+
+                    "error_x":
+                        error[0],
+
+                    "error_y":
+                        error[1],
+
+                    "error_z":
+                        error[2],
+
+                    "distance_m":
+                        distance,
+
+
+                    # Velocity
+
+                    "velocity_x":
+                        current_vel[0],
+
+                    "velocity_y":
+                        current_vel[1],
+
+                    "velocity_z":
+                        current_vel[2],
+
+
+                    # Raw PPO action
+
+                    "raw_action_x":
+                        raw_action[0],
+
+                    "raw_action_y":
+                        raw_action[1],
+
+                    "raw_action_z":
+                        raw_action[2],
+
+
+                    # Scaled action
+
+                    "action_x":
+                        action[0],
+
+                    "action_y":
+                        action[1],
+
+                    "action_z":
+                        action[2],
+
+
+                    # Action metrics
+
+                    "action_norm":
+                        np.linalg.norm(
+                            action
+                        ),
+
+                    "action_change":
+                        action_change,
+
+
+                    # Controller target
+
+                    "target_x":
+                        target_position[0],
+
+                    "target_y":
+                        target_position[1],
+
+                    "target_z":
+                        target_position[2],
+
+
+                    # Trajectory metrics
+
+                    "step_displacement_m":
+                        step_displacement,
+
+                    "trajectory_length_m":
+                        trajectory_length,
+
+                })
+
+
+                # =================================================
+                # Console Output
+                # =================================================
+
+                if (
+                    step_count
+                    % CONTROL_FREQ
+                    == 0
+                ):
+
+                    print(
+                        "\n"
+                        + "-"
+                        * 50
+                    )
+
+                    print(
+                        f"Step "
+                        f"{step_count}"
+                    )
+
+                    print(
+                        f"  EE position:    "
+                        f"{current_ee.round(4)}"
+                    )
+
+                    print(
+                        f"  Goal:           "
+                        f"{target_real.round(4)}"
+                    )
+
+                    print(
+                        f"  Error xyz:      "
+                        f"{error.round(4)}"
+                    )
+
+                    print(
+                        f"  Distance:       "
+                        f"{distance * 100:.2f} cm"
+                    )
+
+                    print(
+                        f"  Velocity:       "
+                        f"{current_vel.round(4)}"
+                    )
+
+                    print(
+                        f"  Raw PPO action: "
+                        f"{raw_action.round(4)}"
+                    )
+
+                    print(
+                        f"  Command delta:  "
+                        f"{action.round(4)}"
+                    )
+
+                    print(
+                        f"  Ctrl target:    "
+                        f"{target_position.round(4)}"
+                    )
+
+
+                # =================================================
+                # Success Condition
+                # =================================================
+
+                if (
+                    distance
+                    < GOAL_THRESHOLD
+                ):
+
+                    success = True
+
+                    termination_reason = (
+                        "goal_reached"
+                    )
+
+
+                    print(
+                        "\nGoal reached!"
+                    )
+
+                    print(
+                        f"Final distance: "
+                        f"{distance * 100:.3f} cm"
+                    )
+
+                    break
+
+
+        # ====================================================
+        # Context Finished Naturally
+        # ====================================================
+
+        if not success:
+
+            termination_reason = (
+                "max_runtime"
+            )
+
+
+    # ========================================================
+    # User Interrupt
+    # ========================================================
 
     except KeyboardInterrupt:
 
-        print("\nEpisode interrupted by user.")
+        termination_reason = (
+            "user_interrupt"
+        )
+
+
+        print(
+            "\n\nInterrupted by user"
+        )
+
+
+    # ========================================================
+    # Unexpected Error
+    # ========================================================
+
+    except Exception as e:
+
+        termination_reason = (
+            f"error:{type(e).__name__}"
+        )
+
+
+        print(
+            f"\n\nError: {e}"
+        )
+
+
+    # ========================================================
+    # Cleanup + Save Results
+    # ========================================================
 
     finally:
 
-        panda.stop_controller()
 
-    # --------------------------------------------------------
-    # Final metrics
-    # --------------------------------------------------------
+        elapsed_time = (
 
-    final_pos = panda.get_position().copy()
+            time.perf_counter()
 
-    final_error = np.linalg.norm(
-        target_real - final_pos
-    )
+            - start_time
 
-    episode_time = time.time() - start_time
+        )
 
-    print("\nEpisode result")
-    print("-" * 40)
 
-    print(
-        f"Success           : {success}"
-    )
+        # ====================================================
+        # Smoothness Metrics
+        # ====================================================
 
-    print(
-        f"Final error       : "
-        f"{final_error * 100:.2f} cm"
-    )
+        if (
+            len(action_changes)
+            > 0
+        ):
 
-    print(
-        f"Time              : "
-        f"{episode_time:.2f} s"
-    )
+            mean_action_change = (
+                float(
+                    np.mean(
+                        action_changes
+                    )
+                )
+            )
 
-    print(
-        f"Trajectory length : "
-        f"{trajectory_length * 100:.2f} cm"
-    )
 
-    print(
-        f"Steps             : "
-        f"{num_steps}"
-    )
+            max_action_change = (
+                float(
+                    np.max(
+                        action_changes
+                    )
+                )
+            )
 
-    return {
 
-        "episode": episode_id,
+        else:
 
-        "offset_x_m": goal_offset[0],
-        "offset_y_m": goal_offset[1],
-        "offset_z_m": goal_offset[2],
+            mean_action_change = (
+                np.nan
+            )
 
-        "target_x_m": target_real[0],
-        "target_y_m": target_real[1],
-        "target_z_m": target_real[2],
+            max_action_change = (
+                np.nan
+            )
 
-        "initial_distance_cm":
-            initial_distance * 100,
 
-        "success":
-            int(success),
+        # ====================================================
+        # Panda Log
+        # ====================================================
 
-        "final_error_cm":
-            final_error * 100,
+        try:
 
-        "time_s":
-            episode_time,
+            panda.disable_logging()
 
-        "trajectory_length_cm":
-            trajectory_length * 100,
+            log = (
+                panda.get_log()
+            )
 
-        "steps":
-            num_steps,
-    }
+        except Exception:
+
+            log = None
+
+
+        # ====================================================
+        # Stop Controller
+        # ====================================================
+
+        if not DRY_RUN:
+
+            try:
+
+                panda.stop_controller()
+
+            except Exception:
+
+                pass
+
+
+        # ====================================================
+        # Save Step CSV
+        # ====================================================
+
+        step_log_file = os.path.join(
+
+            RUN_DIR,
+
+            f"run_{run_id}.csv"
+
+        )
+
+
+        save_step_log(
+
+            step_records,
+
+            step_log_file
+
+        )
+
+
+        print(
+            f"\nStep log saved: "
+            f"{step_log_file}"
+        )
+
+
+        # ====================================================
+        # Episode Summary
+        # ====================================================
+
+        result = {
+
+            "run_id":
+                run_id,
+
+            "episode":
+                episode_id,
+
+            "checkpoint":
+                CHECKPOINT_PATH,
+
+            "success":
+                success,
+
+            "termination_reason":
+                termination_reason,
+
+
+            # Goal offset
+
+            "offset_x":
+                goal_offset[0],
+
+            "offset_y":
+                goal_offset[1],
+
+            "offset_z":
+                goal_offset[2],
+
+
+            # Start
+
+            "start_x":
+                x0[0],
+
+            "start_y":
+                x0[1],
+
+            "start_z":
+                x0[2],
+
+
+            # Goal
+
+            "goal_x":
+                target_real[0],
+
+            "goal_y":
+                target_real[1],
+
+            "goal_z":
+                target_real[2],
+
+
+            # Performance
+
+            "initial_distance_cm":
+                initial_distance * 100,
+
+            "final_distance_cm":
+                final_distance * 100,
+
+            "steps":
+                step_count,
+
+            "time_sec":
+                elapsed_time,
+
+            "trajectory_length_cm":
+                trajectory_length * 100,
+
+
+            # Smoothness
+
+            "mean_action_change":
+                mean_action_change,
+
+            "max_action_change":
+                max_action_change,
+
+
+            # Evaluation configuration
+
+            "control_freq_hz":
+                CONTROL_FREQ,
+
+            "action_scale":
+                ACTION_SCALE,
+
+            "max_step_m":
+                MAX_STEP,
+
+            "goal_threshold_cm":
+                GOAL_THRESHOLD * 100,
+
+            "dry_run":
+                DRY_RUN,
+
+        }
+
+
+        save_episode_summary(
+            result
+        )
+
+
+        print(
+            f"Episode summary appended: "
+            f"{EPISODE_SUMMARY_FILE}"
+        )
+
+
+        # ====================================================
+        # Save Panda Raw Log
+        # ====================================================
+
+        if (
+            log is not None
+            and len(log) > 0
+        ):
+
+            panda_log_file = os.path.join(
+
+                RUN_DIR,
+
+                f"run_{run_id}_panda.npy"
+
+            )
+
+
+            np.save(
+                panda_log_file,
+                log
+            )
+
+
+            print(
+                f"Panda log saved: "
+                f"{panda_log_file}"
+            )
+
+
+        # ====================================================
+        # Print Episode Result
+        # ====================================================
+
+        print("\n")
+        print("=" * 60)
+
+        print(
+            "EPISODE RESULT"
+        )
+
+        print("=" * 60)
+
+
+        print(
+            f"Success:              "
+            f"{success}"
+        )
+
+        print(
+            f"Termination:          "
+            f"{termination_reason}"
+        )
+
+        print(
+            f"Initial distance:     "
+            f"{initial_distance * 100:.3f} cm"
+        )
+
+        print(
+            f"Final distance:       "
+            f"{final_distance * 100:.3f} cm"
+        )
+
+        print(
+            f"Episode steps:        "
+            f"{step_count}"
+        )
+
+        print(
+            f"Episode time:         "
+            f"{elapsed_time:.3f} s"
+        )
+
+        print(
+            f"Trajectory length:    "
+            f"{trajectory_length * 100:.3f} cm"
+        )
+
+        print(
+            f"Mean action change:   "
+            f"{mean_action_change:.6f}"
+        )
+
+        print(
+            f"Max action change:    "
+            f"{max_action_change:.6f}"
+        )
+
+        print("=" * 60)
+
+
+    return result
 
 
 # ============================================================
-# Main
+# Main Benchmark
 # ============================================================
 
 def main():
 
-    logging.basicConfig(
-        level=logging.INFO
+
+    # ========================================================
+    # Create Result Directories
+    # ========================================================
+
+    os.makedirs(
+        RUN_DIR,
+        exist_ok=True
+    )
+
+
+    print("=" * 70)
+
+    print(
+        "PPO REAL ROBOT REACH BENCHMARK"
     )
 
     print("=" * 70)
-    print("REAL ROBOT PPO REACH BENCHMARK")
-    print("=" * 70)
 
-    # --------------------------------------------------------
-    # Load PPO
-    # --------------------------------------------------------
 
-    print(
-        f"Loading checkpoint: "
-        f"{CHECKPOINT_PATH}"
-    )
-
-    model = PPO.load(
-        CHECKPOINT_PATH
-    )
-
-    print("Checkpoint loaded.")
-
-    # --------------------------------------------------------
-    # Connect Franka
-    # --------------------------------------------------------
+    # ========================================================
+    # Connect Robot
+    # ========================================================
 
     print(
-        f"Connecting to Franka: "
+        f"Connecting to robot: "
         f"{HOSTNAME}"
     )
+
 
     panda = panda_py.Panda(
         HOSTNAME
     )
 
-    print("Robot connected.")
 
-    # --------------------------------------------------------
-    # CSV
-    # --------------------------------------------------------
-
-    os.makedirs(
-        "results",
-        exist_ok=True,
+    print(
+        "Robot connected."
     )
 
-    timestamp = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
+
+    # ========================================================
+    # Load PPO
+    # ========================================================
+
+    print(
+        f"Loading policy: "
+        f"{CHECKPOINT_PATH}"
     )
 
-    csv_path = (
-        f"results/"
-        f"ppo_reach_real_{timestamp}.csv"
+
+    model = PPO.load(
+        CHECKPOINT_PATH
     )
+
+
+    print(
+        "Policy loaded."
+    )
+
+
+    # ========================================================
+    # Show Benchmark Settings
+    # ========================================================
+
+    print("\nBenchmark configuration:")
+
+
+    print(
+        f"  Episodes:       "
+        f"{len(GOAL_OFFSETS)}"
+    )
+
+    print(
+        f"  Control freq:   "
+        f"{CONTROL_FREQ} Hz"
+    )
+
+    print(
+        f"  Max runtime:    "
+        f"{MAX_RUNTIME} s"
+    )
+
+    print(
+        f"  Action scale:   "
+        f"{ACTION_SCALE}"
+    )
+
+    print(
+        f"  Max step:       "
+        f"{MAX_STEP * 100:.1f} cm"
+    )
+
+    print(
+        f"  Goal threshold: "
+        f"{GOAL_THRESHOLD * 100:.1f} cm"
+    )
+
+    print(
+        f"  DRY_RUN:        "
+        f"{DRY_RUN}"
+    )
+
+
+    # ========================================================
+    # Benchmark Results
+    # ========================================================
 
     results = []
 
-    # --------------------------------------------------------
-    # Run benchmark
-    # --------------------------------------------------------
-
-    for i, offset in enumerate(
-        GOAL_OFFSETS,
-        start=1,
-    ):
-
-        result = run_episode(
-            panda,
-            model,
-            i,
-            offset,
-        )
-
-        if result is not None:
-
-            results.append(
-                result
-            )
-
-            # Save after EVERY episode
-            # so results survive interruption
-
-            with open(
-                csv_path,
-                "w",
-                newline="",
-            ) as f:
-
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=result.keys(),
-                )
-
-                writer.writeheader()
-
-                writer.writerows(
-                    results
-                )
-
-        print(
-            f"\nProgress: "
-            f"{i}/{len(GOAL_OFFSETS)}"
-        )
 
     # ========================================================
-    # Summary
+    # Run All Fixed Goals
+    # ========================================================
+
+    for (
+        episode_id,
+        goal_offset
+    ) in enumerate(
+        GOAL_OFFSETS,
+        start=1
+    ):
+
+
+        result = run_episode(
+
+            panda,
+
+            model,
+
+            goal_offset,
+
+            episode_id
+
+        )
+
+
+        results.append(
+            result
+        )
+
+
+        print(
+            f"\nBenchmark progress: "
+            f"{episode_id}/"
+            f"{len(GOAL_OFFSETS)}"
+        )
+
+
+        # Stop entire benchmark
+        # if Ctrl+C was used
+
+        if (
+            result[
+                "termination_reason"
+            ]
+            == "user_interrupt"
+        ):
+
+            print(
+                "\nBenchmark interrupted."
+            )
+
+            break
+
+
+    # ========================================================
+    # No Results
     # ========================================================
 
     if len(results) == 0:
+
+        print(
+            "No benchmark results."
+        )
+
         return
 
+
+    # ========================================================
+    # Convert Results
+    # ========================================================
+
     successes = np.array([
-        r["success"]
+
+        int(
+            r["success"]
+        )
+
         for r in results
+
     ])
 
-    final_errors = np.array([
-        r["final_error_cm"]
+
+    errors = np.array([
+
+        r["final_distance_cm"]
+
         for r in results
+
     ])
 
-    times = np.array([
-        r["time_s"]
+
+    runtimes = np.array([
+
+        r["time_sec"]
+
         for r in results
+
     ])
 
-    paths = np.array([
+
+    trajectory_lengths = np.array([
+
         r["trajectory_length_cm"]
+
         for r in results
+
     ])
+
+
+    action_smoothness = np.array([
+
+        r["mean_action_change"]
+
+        for r in results
+
+    ])
+
+
+    # ========================================================
+    # Final Benchmark Summary
+    # ========================================================
 
     print("\n")
     print("=" * 70)
-    print("BENCHMARK RESULTS")
-    print("=" * 70)
 
     print(
-        f"Episodes: "
+        "BENCHMARK SUMMARY"
+    )
+
+    print("=" * 70)
+
+
+    print(
+        f"Episodes completed:      "
         f"{len(results)}"
     )
 
-    print(
-        f"Success rate: "
-        f"{successes.mean()*100:.1f}%"
-    )
 
     print(
-        f"Mean final error: "
-        f"{final_errors.mean():.2f} cm"
+        f"Successes:               "
+        f"{successes.sum()}/"
+        f"{len(successes)}"
     )
 
-    print(
-        f"Median final error: "
-        f"{np.median(final_errors):.2f} cm"
-    )
 
     print(
-        f"Mean time: "
-        f"{times.mean():.2f} s"
+        f"Success rate:            "
+        f"{successes.mean() * 100:.1f}%"
     )
 
-    print(
-        f"Mean trajectory length: "
-        f"{paths.mean():.2f} cm"
-    )
 
     print(
-        f"\nResults saved to:\n"
-        f"{csv_path}"
+        f"Mean final error:        "
+        f"{errors.mean():.3f} cm"
     )
+
+
+    print(
+        f"Median final error:      "
+        f"{np.median(errors):.3f} cm"
+    )
+
+
+    print(
+        f"Std final error:         "
+        f"{errors.std():.3f} cm"
+    )
+
+
+    print(
+        f"Minimum final error:     "
+        f"{errors.min():.3f} cm"
+    )
+
+
+    print(
+        f"Maximum final error:     "
+        f"{errors.max():.3f} cm"
+    )
+
+
+    print(
+        f"Mean runtime:            "
+        f"{runtimes.mean():.3f} s"
+    )
+
+
+    print(
+        f"Mean trajectory length:  "
+        f"{trajectory_lengths.mean():.3f} cm"
+    )
+
+
+    valid_smoothness = (
+        action_smoothness[
+            ~np.isnan(
+                action_smoothness
+            )
+        ]
+    )
+
+
+    if (
+        len(valid_smoothness)
+        > 0
+    ):
+
+        print(
+            f"Mean action smoothness:  "
+            f"{valid_smoothness.mean():.6f}"
+        )
+
 
     print("=" * 70)
 
 
+    print(
+        f"\nEpisode summary file:\n"
+        f"{EPISODE_SUMMARY_FILE}"
+    )
+
+
+    print(
+        f"\nDetailed run files:\n"
+        f"{RUN_DIR}"
+    )
+
+
+    print("\nBenchmark finished.")
+
+
+# ============================================================
+# Entry Point
+# ============================================================
+
 if __name__ == "__main__":
+
     main()
