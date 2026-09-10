@@ -106,7 +106,7 @@ class PushShapedReward(gym.Wrapper):
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array", reward_type='dense')
+            env = gym.make(env_id, render_mode="rgb_array", reward_type='dense',control_type='joints')
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id,reward_type='dense',control_type='joints')
