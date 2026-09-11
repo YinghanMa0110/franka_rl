@@ -63,7 +63,7 @@ MAX_STEP = 0.02
 
 CONTROL_FREQ = 20
 
-MAX_RUNTIME = 30
+MAX_RUNTIME = 15
 
 # PandaReach success threshold
 GOAL_THRESHOLD = 0.05

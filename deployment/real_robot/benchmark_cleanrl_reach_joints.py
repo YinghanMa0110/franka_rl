@@ -535,7 +535,7 @@ def main():
     parser.add_argument(
         "--episodes",
         type = int,
-        default=1,
+        default=3,
     )
 
     args = parser.parse_args()
@@ -762,6 +762,8 @@ def main():
                     f"step={steps:02d} "
                     f"distance="
                     f"{current_distance * 100:.2f} cm "
+                    f"orientation="
+                    f"{info['orientation_deviation_deg']:.1f} deg"
                     f"action="
                     f"{np.round(action, 3)}"
                 )
