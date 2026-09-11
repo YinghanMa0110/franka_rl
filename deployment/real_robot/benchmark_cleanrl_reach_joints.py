@@ -11,6 +11,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 import panda_py
+from reach_joint_env import FrankaReachJointEnv
 
 
 # ============================================================
@@ -504,353 +505,6 @@ class SACPolicy:
 
 
 # ============================================================
-# Real robot benchmark
-# ============================================================
-
-class FrankaReachJointBenchmark:
-
-    def __init__(
-        self,
-        panda,
-        policy,
-        algo_name,
-    ):
-
-        self.panda = panda
-        self.policy = policy
-        self.algo_name = algo_name
-
-        self.prev_pos = None
-
-        self.target_real = None
-
-        self.step_count = 0
-
-        self.ep_return = 0.0
-
-        self.minimum_distance = np.inf
-
-
-    # ========================================================
-    # Read robot state
-    # ========================================================
-
-    def get_q(self):
-
-        state = self.panda.get_state()
-
-        q = np.asarray(
-            state.q,
-            dtype=np.float64,
-        )[:7]
-
-        return q
-
-
-    def get_position(self):
-
-        return np.asarray(
-            self.panda.get_position(),
-            dtype=np.float64,
-        )
-
-
-    # ========================================================
-    # TODO TOMORROW:
-    # Fill in the actual panda_py joint controller.
-    # ========================================================
-
-    def _send_joint_target(
-        self,
-        q_target,
-    ):
-
-        raise NotImplementedError(
-            "\nJoint realtime controller has not "
-            "been connected yet.\n"
-            "Tomorrow on Jetson run:\n\n"
-            "from panda_py import controllers\n"
-            "print(dir(controllers))\n\n"
-            "Then implement only "
-            "_send_joint_target()."
-        )
-
-
-    # ========================================================
-    # Apply panda-gym-equivalent action
-    # ========================================================
-
-    def apply_action(
-        self,
-        action,
-    ):
-
-        action = np.asarray(
-            action,
-            dtype=np.float64,
-        ).flatten()
-
-        if action.shape != (7,):
-            raise RuntimeError(
-                f"Expected action shape (7,), "
-                f"got {action.shape}"
-            )
-
-        action = np.clip(
-            action,
-            -1.0,
-            1.0,
-        )
-
-        q_current = self.get_q()
-
-        # EXACT panda-gym joint semantics:
-        #
-        # q_target = q_current + action * 0.05
-        #
-        delta_q = (
-            action
-            * JOINT_ACTION_SCALE
-        )
-
-        q_target = (
-            q_current
-            + delta_q
-        )
-
-        # Joint safety layer
-        q_target = np.clip(
-            q_target,
-            SAFE_JOINT_LOW,
-            SAFE_JOINT_HIGH,
-        )
-
-        self._send_joint_target(
-            q_target
-        )
-
-        time.sleep(DT)
-
-
-    # ========================================================
-    # Reset
-    # ========================================================
-
-    def reset(
-        self,
-        goal_offset,
-    ):
-
-        print(
-            "\nReturning robot to start..."
-        )
-
-        try:
-
-            self.panda.move_to_start()
-
-        except Exception:
-
-            print(
-                "move_to_start failed, recovering..."
-            )
-
-            self.panda.recover()
-
-            self.panda.move_to_start()
-
-        time.sleep(0.5)
-
-        x0 = self.get_position()
-
-        self.prev_pos = x0.copy()
-
-        target = (
-            x0
-            + np.asarray(goal_offset)
-        )
-
-        target = np.clip(
-            target,
-            WORKSPACE_LOW,
-            WORKSPACE_HIGH,
-        )
-
-        self.target_real = target
-
-        self.step_count = 0
-
-        self.ep_return = 0.0
-
-        initial_distance = np.linalg.norm(
-            x0 - target
-        )
-
-        self.minimum_distance = (
-            initial_distance
-        )
-
-        return (
-            x0,
-            initial_distance,
-        )
-
-
-    # ========================================================
-    # Run one benchmark episode
-    # ========================================================
-
-    def run_episode(
-        self,
-        goal_offset,
-    ):
-
-        (
-            current_pos,
-            initial_distance,
-        ) = self.reset(
-            goal_offset
-        )
-
-        print(
-            f"Initial distance: "
-            f"{initial_distance * 100:.2f} cm"
-        )
-
-        print(
-            "Goal real:",
-            np.round(
-                self.target_real,
-                4,
-            ),
-        )
-
-
-        success = False
-
-
-        for step in range(
-            MAX_EP_STEPS
-        ):
-
-            current_pos = self.get_position()
-
-            velocity = (
-                current_pos
-                - self.prev_pos
-            ) * CONTROL_FREQ
-
-            self.prev_pos = (
-                current_pos.copy()
-            )
-
-
-            raw_obs = build_flat_obs(
-                current_pos,
-                velocity,
-                self.target_real,
-            )
-
-
-            action = self.policy.predict(
-                raw_obs
-            )
-
-
-            print(
-                f"step={step + 1:02d} "
-                f"action="
-                f"{np.round(action, 3)}"
-            )
-
-
-            self.apply_action(
-                action
-            )
-
-
-            new_pos = self.get_position()
-
-
-            # Workspace emergency check
-            if np.any(
-                new_pos < WORKSPACE_LOW
-            ) or np.any(
-                new_pos > WORKSPACE_HIGH
-            ):
-
-                raise RuntimeError(
-                    "EE left safe workspace."
-                )
-
-
-            distance = np.linalg.norm(
-                new_pos
-                - self.target_real
-            )
-
-
-            reward = -float(
-                distance
-            )
-
-
-            self.ep_return += (
-                reward
-            )
-
-
-            self.minimum_distance = min(
-                self.minimum_distance,
-                distance,
-            )
-
-
-            self.step_count += 1
-
-
-            print(
-                f"      distance="
-                f"{distance * 100:.2f} cm"
-            )
-
-
-            if distance < GOAL_THRESHOLD:
-
-                success = True
-
-                break
-
-
-        final_pos = self.get_position()
-
-        final_distance = np.linalg.norm(
-            final_pos
-            - self.target_real
-        )
-
-
-        return {
-            "success": int(success),
-
-            "initial_distance_cm":
-                initial_distance * 100,
-
-            "final_distance_cm":
-                final_distance * 100,
-
-            "minimum_distance_cm":
-                self.minimum_distance * 100,
-
-            "steps":
-                self.step_count,
-
-            "return":
-                self.ep_return,
-        }
-
-
-# ============================================================
 # Main
 # ============================================================
 
@@ -868,7 +522,7 @@ def main():
     )
 
     parser.add_argument(
-        "--episodes",
+        "--checkpoint-step",
         type=int,
         default=20,
     )
@@ -921,10 +575,10 @@ def main():
     )
 
 
-    benchmark = FrankaReachJointBenchmark(
+    env = FrankaReachJointEnv(
         panda,
-        policy,
-        args.algo,
+        goal_threshold = 0.02,
+        max_ep_steps = 50
     )
 
 
@@ -995,9 +649,7 @@ def main():
 
     try:
 
-        for episode in range(
-            args.episodes
-        ):
+        for episode in range(args.episodes):
 
             print(
                 "\n"
@@ -1014,23 +666,150 @@ def main():
                 "=" * 70
             )
 
+            # =================================================
+            # Fixed benchmark goal
+            # =================================================
 
-            result = benchmark.run_episode(
-                GOAL_OFFSETS[
-                    episode
-                    % len(GOAL_OFFSETS)
-                ]
+            goal_offset = GOAL_OFFSETS[
+                episode % len(GOAL_OFFSETS)
+            ]
+
+            obs, info = env.reset(
+                options={
+                    "goal_offset": goal_offset
+                }
+            )
+
+            initial_distance = float(
+                info["initial_distance"]
+            )
+
+            minimum_distance = (
+                initial_distance
+            )
+
+            episode_return = 0.0
+
+            steps = 0
+
+            terminated = False
+            truncated = False
+
+
+            print(
+                f"Initial distance: "
+                f"{initial_distance * 100:.2f} cm"
+            )
+
+            print(
+                f"Goal offset: "
+                f"{np.round(goal_offset, 4)}"
             )
 
 
-            result["episode"] = (
-                episode + 1
+            # =================================================
+            # Episode loop
+            # =================================================
+
+            while not (
+                terminated
+                or truncated
+            ):
+
+                # Policy handles its own obs_rms normalization
+                action = policy.predict(
+                    obs
+                )
+
+                (
+                    obs,
+                    reward,
+                    terminated,
+                    truncated,
+                    info,
+                ) = env.step(
+                    action
+                )
+
+                episode_return += float(
+                    reward
+                )
+
+                steps += 1
+
+                current_distance = float(
+                    info["distance"]
+                )
+
+                minimum_distance = min(
+                    minimum_distance,
+                    current_distance,
+                )
+
+
+                print(
+                    f"step={steps:02d} "
+                    f"distance="
+                    f"{current_distance * 100:.2f} cm "
+                    f"action="
+                    f"{np.round(action, 3)}"
+                )
+
+
+                if info.get(
+                    "safety_reason"
+                ) not in (
+                    None,
+                    "time_limit",
+                ):
+
+                    print(
+                        f"[safety] "
+                        f"{info['safety_reason']}"
+                    )
+
+
+            # =================================================
+            # Episode result
+            # =================================================
+
+            final_distance = float(
+                info["distance"]
+            )
+
+            success = bool(
+                info["is_success"]
             )
 
 
-            result["algo"] = (
-                args.algo
-            )
+            result = {
+                "episode":
+                    episode + 1,
+
+                "algo":
+                    args.algo,
+
+                "checkpoint_step":
+                    args.checkpoint_step,
+
+                "success":
+                    int(success),
+
+                "initial_distance_cm":
+                    initial_distance * 100.0,
+
+                "final_distance_cm":
+                    final_distance * 100.0,
+
+                "minimum_distance_cm":
+                    minimum_distance * 100.0,
+
+                "steps":
+                    steps,
+
+                "return":
+                    episode_return,
+            }
 
 
             results.append(
@@ -1040,13 +819,15 @@ def main():
 
             print(
                 f"\n"
-                f"{'SUCCESS' if result['success'] else 'FAIL'}"
+                f"{'SUCCESS' if success else 'FAIL'}"
                 f" | final="
-                f"{result['final_distance_cm']:.2f} cm"
+                f"{final_distance * 100:.2f} cm"
                 f" | min="
-                f"{result['minimum_distance_cm']:.2f} cm"
+                f"{minimum_distance * 100:.2f} cm"
                 f" | steps="
-                f"{result['steps']}"
+                f"{steps}"
+                f" | return="
+                f"{episode_return:.3f}"
             )
 
 
@@ -1059,18 +840,19 @@ def main():
 
     finally:
 
-        try:
-            panda.stop_controller()
-        except Exception:
-            pass
+        print(
+            "\nClosing real-robot environment..."
+        )
 
         try:
-            panda.move_to_start()
-        except Exception:
-            pass
+            env.close()
 
+        except Exception as e:
 
-    # ========================================================
+            print(
+                f"[close] warning: {e}"
+            )
+    # ===============================
     # Save
     # ========================================================
 
@@ -1086,6 +868,7 @@ def main():
     fieldnames = [
         "episode",
         "algo",
+        "checkpoint_step",
         "success",
         "initial_distance_cm",
         "final_distance_cm",

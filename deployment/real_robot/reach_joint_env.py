@@ -1,0 +1,965 @@
+import time
+from panda_py import controllers
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+
+
+# ============================================================
+# Default configuration
+# ============================================================
+
+CONTROL_FREQ = 20
+MAX_EP_STEPS = 50
+
+GOAL_THRESHOLD = 0.02       # 2 cm
+
+# EXACT panda-gym joint-control semantics:
+#
+# action ∈ [-1, 1]^7
+# delta_q = action * 0.05 rad
+# q_target = q_current + delta_q
+#
+JOINT_ACTION_SCALE = 0.05
+
+
+# ============================================================
+# Franka joint limits
+# ============================================================
+
+JOINT_LOW = np.array([
+    -2.8973,
+    -1.7628,
+    -2.8973,
+    -3.0718,
+    -2.8973,
+    -0.0175,
+    -2.8973,
+], dtype=np.float64)
+
+JOINT_HIGH = np.array([
+    2.8973,
+    1.7628,
+    2.8973,
+    -0.0698,
+    2.8973,
+    3.7525,
+    2.8973,
+], dtype=np.float64)
+
+# Stay away from mechanical limits
+JOINT_MARGIN = 0.10
+
+SAFE_JOINT_LOW = JOINT_LOW + JOINT_MARGIN
+SAFE_JOINT_HIGH = JOINT_HIGH - JOINT_MARGIN
+
+
+# ============================================================
+# Workspace safety
+# ============================================================
+
+WORKSPACE_LOW = np.array([
+    0.25,
+    -0.25,
+    0.00,
+], dtype=np.float64)
+
+WORKSPACE_HIGH = np.array([
+    0.65,
+    0.25,
+    0.60,
+], dtype=np.float64)
+
+
+# ============================================================
+# Coordinate conversion
+#
+# This is inherited from your previous real-robot deployment.
+# VERIFY ON JETSON BEFORE FIRST JOINT BENCHMARK.
+# ============================================================
+
+BASE_OFFSET = np.array([
+    -1.0,
+    0.0,
+    0.0,
+], dtype=np.float64)
+
+
+class FrankaReachJointEnv(gym.Env):
+    """
+    Shared real-robot Reach environment for CleanRL PPO and SAC.
+
+    Raw observation:
+        12D flattened PandaReach-style observation
+
+        [
+            achieved_goal (3),
+            desired_goal  (3),
+            observation   (6)
+        ]
+
+        where observation = [EE position, EE velocity]
+
+    Action:
+        7D normalized joint action in [-1, 1]
+
+        delta_q = action * 0.05 rad
+        q_target = q_current + delta_q
+
+    Reward:
+        -Euclidean EE-to-goal distance
+
+    Success:
+        distance < 0.02 m
+
+    IMPORTANT:
+        This environment outputs RAW observations.
+
+        PPO/SAC-specific observation normalization using obs_rms.npz
+        should be handled by the online-training / benchmark scripts,
+        not inside this shared environment.
+    """
+
+    metadata = {
+        "render_modes": []
+    }
+
+    def __init__(
+        self,
+        panda,
+        *,
+        goal_low=None,
+        goal_high=None,
+        goal_threshold=GOAL_THRESHOLD,
+        max_ep_steps=MAX_EP_STEPS,
+        control_freq=CONTROL_FREQ,
+        joint_action_scale=JOINT_ACTION_SCALE,
+        workspace_low=WORKSPACE_LOW,
+        workspace_high=WORKSPACE_HIGH,
+        safe_joint_low=SAFE_JOINT_LOW,
+        safe_joint_high=SAFE_JOINT_HIGH,
+        base_offset=BASE_OFFSET,
+    ):
+        super().__init__()
+
+        self.panda = panda
+
+        # ----------------------------------------------------
+        # Task configuration
+        # ----------------------------------------------------
+
+        self.goal_threshold = float(
+            goal_threshold
+        )
+
+        self.max_ep_steps = int(
+            max_ep_steps
+        )
+
+        self.control_freq = float(
+            control_freq
+        )
+
+        self.dt = (
+            1.0 / self.control_freq
+        )
+
+        self.joint_action_scale = float(
+            joint_action_scale
+        )
+
+        # ----------------------------------------------------
+        # Online-training goal distribution
+        #
+        # Start conservatively:
+        # +/- 8 cm around start EE.
+        # ----------------------------------------------------
+
+        if goal_low is None:
+            goal_low = np.array([
+                -0.08,
+                -0.08,
+                -0.08,
+            ])
+
+        if goal_high is None:
+            goal_high = np.array([
+                0.08,
+                0.08,
+                0.08,
+            ])
+
+        self.goal_low = np.asarray(
+            goal_low,
+            dtype=np.float64,
+        )
+
+        self.goal_high = np.asarray(
+            goal_high,
+            dtype=np.float64,
+        )
+
+        # ----------------------------------------------------
+        # Safety
+        # ----------------------------------------------------
+
+        self.workspace_low = np.asarray(
+            workspace_low,
+            dtype=np.float64,
+        )
+
+        self.workspace_high = np.asarray(
+            workspace_high,
+            dtype=np.float64,
+        )
+
+        self.safe_joint_low = np.asarray(
+            safe_joint_low,
+            dtype=np.float64,
+        )
+
+        self.safe_joint_high = np.asarray(
+            safe_joint_high,
+            dtype=np.float64,
+        )
+
+        self.base_offset = np.asarray(
+            base_offset,
+            dtype=np.float64,
+        )
+
+        # ----------------------------------------------------
+        # Gym spaces
+        # ----------------------------------------------------
+
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(7,),
+            dtype=np.float32,
+        )
+
+        # Raw flattened PandaReach observation
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(12,),
+            dtype=np.float32,
+        )
+
+        # ----------------------------------------------------
+        # Episode state
+        # ----------------------------------------------------
+
+        self.target_real = None
+
+        self.prev_pos = None
+
+        self.step_count = 0
+
+        self.ep_return = 0.0
+
+        self.minimum_distance = np.inf
+
+        self.initial_distance = None
+
+        self.controller_running = False
+
+        self.ctrl = None
+
+
+    # ========================================================
+    # Coordinate conversion
+    # ========================================================
+
+    def real_to_sim(
+        self,
+        real_pos,
+    ):
+        return (
+            np.asarray(
+                real_pos,
+                dtype=np.float64,
+            )
+            + self.base_offset
+        )
+
+
+    # ========================================================
+    # Robot state
+    # ========================================================
+
+    def get_position(self):
+
+        return np.asarray(
+            self.panda.get_position(),
+            dtype=np.float64,
+        )
+
+
+    def get_q(self):
+
+        state = self.panda.get_state()
+
+        q = np.asarray(
+            state.q,
+            dtype=np.float64,
+        )
+
+        return q[:7].copy()
+
+
+    # ========================================================
+    # Observation
+    # ========================================================
+
+    def build_observation(
+        self,
+        current_pos_real,
+        current_vel_real,
+    ):
+        """
+        Match Gymnasium FlattenObservation ordering for
+        PandaReach Dict observation:
+
+            achieved_goal
+            desired_goal
+            observation
+        """
+
+        current_sim = self.real_to_sim(
+            current_pos_real
+        )
+
+        target_sim = self.real_to_sim(
+            self.target_real
+        )
+
+        achieved_goal = (
+            current_sim.astype(
+                np.float32
+            )
+        )
+
+        desired_goal = (
+            target_sim.astype(
+                np.float32
+            )
+        )
+
+        observation = np.concatenate([
+            current_sim,
+            current_vel_real,
+        ]).astype(
+            np.float32
+        )
+
+        flat_obs = np.concatenate([
+            achieved_goal,
+            desired_goal,
+            observation,
+        ]).astype(
+            np.float32
+        )
+
+        if flat_obs.shape != (12,):
+            raise RuntimeError(
+                f"Expected 12D observation, "
+                f"got {flat_obs.shape}"
+            )
+
+        return flat_obs
+
+
+    # ========================================================
+    # Controller management
+    # ========================================================
+
+    def _start_joint_controller(self):
+
+        self.ctrl = controllers.JointPosition(
+            filter_coeff=1.0,
+        )
+
+        self.panda.start_controller(
+            self.ctrl
+        )
+
+        self.controller_running = True
+
+
+    def _send_joint_target(
+        self,
+        q_target,
+    ):
+
+        q_target = np.asarray(
+        q_target,
+        dtype=np.float64,
+        )
+
+        if q_target.shape != (7,):
+            raise ValueError(
+                f"Expected q_target shape (7,), "
+                f"got {q_target.shape}"
+            )
+
+        self.ctrl.set_control(
+            q_target
+        )
+
+
+    def _stop_controller(self):
+
+        if not self.controller_running:
+            return
+
+        try:
+            self.panda.stop_controller()
+
+        except Exception as e:
+            print(
+                f"[controller] stop warning: {e}"
+            )
+
+        finally:
+            self.controller_running = False
+
+            self.ctrl = None
+
+
+    # ========================================================
+    # Goal sampling
+    # ========================================================
+
+    def sample_goal(
+        self,
+        start_pos,
+    ):
+
+        offset = self.np_random.uniform(
+            low=self.goal_low,
+            high=self.goal_high,
+        )
+
+        target = (
+            start_pos + offset
+        )
+
+        target = np.clip(
+            target,
+            self.workspace_low,
+            self.workspace_high,
+        )
+
+        return target
+
+
+    # ========================================================
+    # Safety checks
+    # ========================================================
+
+    def _check_workspace(
+        self,
+        position,
+    ):
+
+        position = np.asarray(
+            position
+        )
+
+        return bool(
+            np.all(
+                position >= self.workspace_low
+            )
+            and
+            np.all(
+                position <= self.workspace_high
+            )
+        )
+
+
+    def _safe_joint_target(
+        self,
+        q_target,
+    ):
+
+        q_target = np.asarray(
+            q_target,
+            dtype=np.float64,
+        )
+
+        return np.clip(
+            q_target,
+            self.safe_joint_low,
+            self.safe_joint_high,
+        )
+
+
+    # ========================================================
+    # Reset
+    # ========================================================
+
+    def reset(
+        self,
+        *,
+        seed=None,
+        options=None,
+    ):
+
+        super().reset(
+            seed=seed
+        )
+
+        self._stop_controller()
+
+        # ----------------------------------------------------
+        # Return to known start configuration
+        # ----------------------------------------------------
+
+        try:
+
+            self.panda.move_to_start()
+
+        except Exception:
+
+            print(
+                "[reset] move_to_start failed "
+                "-> recover()"
+            )
+
+            self.panda.recover()
+
+            self.panda.move_to_start()
+
+
+        time.sleep(
+            0.5
+        )
+
+
+        start_pos = self.get_position()
+
+
+        if not self._check_workspace(
+            start_pos
+        ):
+
+            raise RuntimeError(
+                f"Start EE position outside workspace: "
+                f"{start_pos}"
+            )
+
+
+        # ----------------------------------------------------
+        # Goal
+        #
+        # Benchmark can provide a fixed goal through options:
+        #
+        # options={
+        #     "target_real": np.array([...])
+        # }
+        #
+        # Otherwise online training gets a random goal.
+        # ----------------------------------------------------
+
+        if (
+            options is not None
+            and
+            "target_real" in options
+        ):
+
+            target = np.asarray(
+                options["target_real"],
+                dtype=np.float64,
+            )
+
+            target = np.clip(
+                target,
+                self.workspace_low,
+                self.workspace_high,
+            )
+
+            self.target_real = target
+
+        elif (
+            options is not None
+            and
+            "goal_offset" in options
+        ):
+
+            offset = np.asarray(
+                options["goal_offset"],
+                dtype=np.float64,
+            )
+
+            target = (
+                start_pos + offset
+            )
+
+            self.target_real = np.clip(
+                target,
+                self.workspace_low,
+                self.workspace_high,
+            )
+
+        else:
+
+            self.target_real = (
+                self.sample_goal(
+                    start_pos
+                )
+            )
+
+
+        self.prev_pos = (
+            start_pos.copy()
+        )
+
+        self.step_count = 0
+
+        self.ep_return = 0.0
+
+
+        self.initial_distance = float(
+            np.linalg.norm(
+                start_pos
+                - self.target_real
+            )
+        )
+
+
+        self.minimum_distance = (
+            self.initial_distance
+        )
+
+
+        # ----------------------------------------------------
+        # Start realtime joint controller
+        # ----------------------------------------------------
+
+        self._start_joint_controller()
+
+
+        obs = self.build_observation(
+            start_pos,
+            np.zeros(
+                3,
+                dtype=np.float64,
+            ),
+        )
+
+
+        info = {
+            "distance":
+                self.initial_distance,
+
+            "is_success":
+                float(
+                    self.initial_distance
+                    < self.goal_threshold
+                ),
+
+            "target_real":
+                self.target_real.copy(),
+
+            "initial_distance":
+                self.initial_distance,
+        }
+
+
+        return (
+            obs,
+            info,
+        )
+
+
+    # ========================================================
+    # Step
+    # ========================================================
+
+    def step(
+        self,
+        action,
+    ):
+
+        action = np.asarray(
+            action,
+            dtype=np.float64,
+        ).flatten()
+
+
+        if action.shape != (7,):
+
+            raise ValueError(
+                f"Expected 7D action, "
+                f"got shape {action.shape}"
+            )
+
+
+        # ----------------------------------------------------
+        # Same clipping as panda-gym
+        # ----------------------------------------------------
+
+        action = np.clip(
+            action,
+            self.action_space.low,
+            self.action_space.high,
+        )
+
+
+        # ----------------------------------------------------
+        # Current joint state
+        # ----------------------------------------------------
+
+        q_current = self.get_q()
+
+
+        # ----------------------------------------------------
+        # EXACT panda-gym mapping
+        #
+        # arm_joint_ctrl *= 0.05
+        # target_q = current_q + arm_joint_ctrl
+        # ----------------------------------------------------
+
+        delta_q = (
+            action
+            * self.joint_action_scale
+        )
+
+
+        q_target = (
+            q_current
+            + delta_q
+        )
+
+
+        # ----------------------------------------------------
+        # Safety layer: joint limits
+        # ----------------------------------------------------
+
+        q_target = (
+            self._safe_joint_target(
+                q_target
+            )
+        )
+
+
+        truncated = False
+
+        safety_reason = None
+
+
+        # ----------------------------------------------------
+        # Send target
+        # ----------------------------------------------------
+
+        try:
+
+            self._send_joint_target(
+                q_target
+            )
+
+            time.sleep(
+                self.dt
+            )
+
+        except Exception as e:
+
+            print(
+                f"[step] controller error: {e}"
+            )
+
+            truncated = True
+
+            safety_reason = (
+                "controller_error"
+            )
+
+
+        # ----------------------------------------------------
+        # Observe new robot state
+        # ----------------------------------------------------
+
+        new_pos = (
+            self.get_position()
+        )
+
+
+        # ----------------------------------------------------
+        # Workspace safety
+        # ----------------------------------------------------
+
+        if not self._check_workspace(
+            new_pos
+        ):
+
+            truncated = True
+
+            safety_reason = (
+                "workspace_violation"
+            )
+
+
+        # ----------------------------------------------------
+        # Velocity
+        # ----------------------------------------------------
+
+        velocity = (
+            new_pos
+            - self.prev_pos
+        ) * self.control_freq
+
+
+        self.prev_pos = (
+            new_pos.copy()
+        )
+
+
+        # ----------------------------------------------------
+        # Distance / reward
+        # ----------------------------------------------------
+
+        distance = float(
+            np.linalg.norm(
+                new_pos
+                - self.target_real
+            )
+        )
+
+
+        reward = -distance
+
+
+        self.minimum_distance = min(
+            self.minimum_distance,
+            distance,
+        )
+
+
+        self.ep_return += (
+            reward
+        )
+
+
+        self.step_count += 1
+
+
+        # ----------------------------------------------------
+        # Success
+        # ----------------------------------------------------
+
+        terminated = bool(
+            distance
+            < self.goal_threshold
+        )
+
+
+        # ----------------------------------------------------
+        # Time limit
+        # ----------------------------------------------------
+
+        if (
+            self.step_count
+            >= self.max_ep_steps
+        ):
+
+            truncated = True
+
+            if safety_reason is None:
+
+                safety_reason = (
+                    "time_limit"
+                )
+
+
+        # ----------------------------------------------------
+        # Observation
+        # ----------------------------------------------------
+
+        obs = self.build_observation(
+            new_pos,
+            velocity,
+        )
+
+
+        # ----------------------------------------------------
+        # Info
+        # ----------------------------------------------------
+
+        info = {
+            "distance":
+                distance,
+
+            "distance_cm":
+                distance * 100.0,
+
+            "minimum_distance":
+                self.minimum_distance,
+
+            "minimum_distance_cm":
+                self.minimum_distance
+                * 100.0,
+
+            "is_success":
+                float(terminated),
+
+            "step_count":
+                self.step_count,
+
+            "episode_return":
+                self.ep_return,
+
+            "q_current":
+                q_current.copy(),
+
+            "q_target":
+                q_target.copy(),
+
+            "action":
+                action.astype(
+                    np.float32
+                ).copy(),
+
+            "target_real":
+                self.target_real.copy(),
+
+            "safety_reason":
+                safety_reason,
+        }
+
+
+        return (
+            obs,
+            float(reward),
+            terminated,
+            truncated,
+            info,
+        )
+
+
+    # ========================================================
+    # Close
+    # ========================================================
+
+    def close(self):
+
+        self._stop_controller()
+
+        try:
+
+            self.panda.move_to_start()
+
+        except Exception:
+
+            try:
+
+                self.panda.recover()
+
+                self.panda.move_to_start()
+
+            except Exception as e:
+
+                print(
+                    f"[close] warning: {e}"
+                )
