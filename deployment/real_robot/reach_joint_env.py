@@ -1,5 +1,7 @@
 import time
+
 from panda_py import controllers
+
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
@@ -10,17 +12,32 @@ from gymnasium import spaces
 # ============================================================
 
 CONTROL_FREQ = 20
+
 MAX_EP_STEPS = 50
 
 GOAL_THRESHOLD = 0.02       # 2 cm
 
-# EXACT panda-gym joint-control semantics:
+# panda-gym joint-control semantics:
 #
 # action ∈ [-1, 1]^7
 # delta_q = action * 0.05 rad
 # q_target = q_current + delta_q
 #
 JOINT_ACTION_SCALE = 0.05
+
+
+# ============================================================
+# Orientation safety
+#
+# The original PandaReach task only optimizes EE position.
+# Orientation is NOT part of the learned observation/reward.
+#
+# For the real robot we monitor orientation separately and
+# terminate the episode if the end-effector rotates too far
+# away from its reset orientation.
+# ============================================================
+
+MAX_ORIENTATION_DEVIATION_DEG = 20.0
 
 
 # ============================================================
@@ -37,6 +54,7 @@ JOINT_LOW = np.array([
     -2.8973,
 ], dtype=np.float64)
 
+
 JOINT_HIGH = np.array([
     2.8973,
     1.7628,
@@ -47,11 +65,20 @@ JOINT_HIGH = np.array([
     2.8973,
 ], dtype=np.float64)
 
-# Stay away from mechanical limits
+
 JOINT_MARGIN = 0.10
 
-SAFE_JOINT_LOW = JOINT_LOW + JOINT_MARGIN
-SAFE_JOINT_HIGH = JOINT_HIGH - JOINT_MARGIN
+
+SAFE_JOINT_LOW = (
+    JOINT_LOW
+    + JOINT_MARGIN
+)
+
+
+SAFE_JOINT_HIGH = (
+    JOINT_HIGH
+    - JOINT_MARGIN
+)
 
 
 # ============================================================
@@ -64,6 +91,7 @@ WORKSPACE_LOW = np.array([
     0.00,
 ], dtype=np.float64)
 
+
 WORKSPACE_HIGH = np.array([
     0.65,
     0.25,
@@ -73,9 +101,6 @@ WORKSPACE_HIGH = np.array([
 
 # ============================================================
 # Coordinate conversion
-#
-# This is inherited from your previous real-robot deployment.
-# VERIFY ON JETSON BEFORE FIRST JOINT BENCHMARK.
 # ============================================================
 
 BASE_OFFSET = np.array([
@@ -98,13 +123,21 @@ class FrankaReachJointEnv(gym.Env):
             observation   (6)
         ]
 
-        where observation = [EE position, EE velocity]
+    where:
+
+        observation =
+            [EE position, EE velocity]
 
     Action:
-        7D normalized joint action in [-1, 1]
+        7D normalized joint action
 
-        delta_q = action * 0.05 rad
-        q_target = q_current + delta_q
+        action ∈ [-1, 1]^7
+
+        delta_q =
+            action * 0.05 rad
+
+        q_target =
+            q_current + delta_q
 
     Reward:
         -Euclidean EE-to-goal distance
@@ -112,17 +145,22 @@ class FrankaReachJointEnv(gym.Env):
     Success:
         distance < 0.02 m
 
-    IMPORTANT:
-        This environment outputs RAW observations.
+    Real-robot safety:
+        - joint limits
+        - Cartesian workspace limits
+        - EE orientation deviation limit
 
-        PPO/SAC-specific observation normalization using obs_rms.npz
-        should be handled by the online-training / benchmark scripts,
-        not inside this shared environment.
+    IMPORTANT:
+        Orientation monitoring is ONLY a safety layer.
+
+        It is not added to the 12D policy observation and does
+        not change the simulation-trained reward.
     """
 
     metadata = {
         "render_modes": []
     }
+
 
     def __init__(
         self,
@@ -139,98 +177,129 @@ class FrankaReachJointEnv(gym.Env):
         safe_joint_low=SAFE_JOINT_LOW,
         safe_joint_high=SAFE_JOINT_HIGH,
         base_offset=BASE_OFFSET,
+        max_orientation_deviation_deg=
+            MAX_ORIENTATION_DEVIATION_DEG,
     ):
+
         super().__init__()
+
 
         self.panda = panda
 
-        # ----------------------------------------------------
-        # Task configuration
-        # ----------------------------------------------------
+
+        # ====================================================
+        # Task
+        # ====================================================
 
         self.goal_threshold = float(
             goal_threshold
         )
 
+
         self.max_ep_steps = int(
             max_ep_steps
         )
+
 
         self.control_freq = float(
             control_freq
         )
 
+
         self.dt = (
-            1.0 / self.control_freq
+            1.0
+            / self.control_freq
         )
+
 
         self.joint_action_scale = float(
             joint_action_scale
         )
 
-        # ----------------------------------------------------
-        # Online-training goal distribution
-        #
-        # Start conservatively:
-        # +/- 8 cm around start EE.
-        # ----------------------------------------------------
+
+        # ====================================================
+        # Goal distribution
+        # ====================================================
 
         if goal_low is None:
+
             goal_low = np.array([
                 -0.08,
                 -0.08,
                 -0.08,
             ])
 
+
         if goal_high is None:
+
             goal_high = np.array([
                 0.08,
                 0.08,
                 0.08,
             ])
 
+
         self.goal_low = np.asarray(
             goal_low,
             dtype=np.float64,
         )
+
 
         self.goal_high = np.asarray(
             goal_high,
             dtype=np.float64,
         )
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # Safety
-        # ----------------------------------------------------
+        # ====================================================
 
         self.workspace_low = np.asarray(
             workspace_low,
             dtype=np.float64,
         )
 
+
         self.workspace_high = np.asarray(
             workspace_high,
             dtype=np.float64,
         )
+
 
         self.safe_joint_low = np.asarray(
             safe_joint_low,
             dtype=np.float64,
         )
 
+
         self.safe_joint_high = np.asarray(
             safe_joint_high,
             dtype=np.float64,
         )
+
 
         self.base_offset = np.asarray(
             base_offset,
             dtype=np.float64,
         )
 
-        # ----------------------------------------------------
+
+        self.max_orientation_deviation_deg = float(
+            max_orientation_deviation_deg
+        )
+
+
+        self.max_orientation_deviation_rad = (
+            np.deg2rad(
+                self.max_orientation_deviation_deg
+            )
+        )
+
+
+        # ====================================================
         # Gym spaces
-        # ----------------------------------------------------
+        # ====================================================
 
         self.action_space = spaces.Box(
             low=-1.0,
@@ -239,7 +308,7 @@ class FrankaReachJointEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Raw flattened PandaReach observation
+
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -247,9 +316,10 @@ class FrankaReachJointEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # ----------------------------------------------------
+
+        # ====================================================
         # Episode state
-        # ----------------------------------------------------
+        # ====================================================
 
         self.target_real = None
 
@@ -262,6 +332,11 @@ class FrankaReachJointEnv(gym.Env):
         self.minimum_distance = np.inf
 
         self.initial_distance = None
+
+
+        # Orientation at reset
+        self.initial_rotation = None
+
 
         self.controller_running = False
 
@@ -276,6 +351,7 @@ class FrankaReachJointEnv(gym.Env):
         self,
         real_pos,
     ):
+
         return (
             np.asarray(
                 real_pos,
@@ -289,7 +365,9 @@ class FrankaReachJointEnv(gym.Env):
     # Robot state
     # ========================================================
 
-    def get_position(self):
+    def get_position(
+        self,
+    ):
 
         return np.asarray(
             self.panda.get_position(),
@@ -297,16 +375,148 @@ class FrankaReachJointEnv(gym.Env):
         )
 
 
-    def get_q(self):
+    def get_q(
+        self,
+    ):
 
-        state = self.panda.get_state()
+        state = (
+            self.panda.get_state()
+        )
+
 
         q = np.asarray(
             state.q,
             dtype=np.float64,
         )
 
+
         return q[:7].copy()
+
+
+    def get_ee_transform(
+        self,
+    ):
+        """
+        Read Franka O_T_EE and convert it into a 4x4 matrix.
+
+        Franka stores the transform in column-major ordering.
+        """
+
+        state = (
+            self.panda.get_state()
+        )
+
+
+        T = np.asarray(
+            state.O_T_EE,
+            dtype=np.float64,
+        ).reshape(
+            4,
+            4,
+            order="F",
+        )
+
+
+        return T
+
+
+    def get_rotation(
+        self,
+    ):
+
+        T = (
+            self.get_ee_transform()
+        )
+
+
+        return T[
+            :3,
+            :3
+        ].copy()
+
+
+    # ========================================================
+    # Orientation
+    # ========================================================
+
+    @staticmethod
+    def rotation_error_rad(
+        reference_rotation,
+        current_rotation,
+    ):
+        """
+        Compute geodesic rotation difference between R_ref and R.
+
+        angle =
+            acos(
+                (trace(R_ref^T R) - 1) / 2
+            )
+
+        Returns radians in [0, pi].
+        """
+
+        R_ref = np.asarray(
+            reference_rotation,
+            dtype=np.float64,
+        )
+
+
+        R = np.asarray(
+            current_rotation,
+            dtype=np.float64,
+        )
+
+
+        R_error = (
+            R_ref.T
+            @ R
+        )
+
+
+        cos_angle = (
+            np.trace(
+                R_error
+            )
+            - 1.0
+        ) / 2.0
+
+
+        # Numerical protection for acos.
+        cos_angle = np.clip(
+            cos_angle,
+            -1.0,
+            1.0,
+        )
+
+
+        angle = np.arccos(
+            cos_angle
+        )
+
+
+        return float(
+            angle
+        )
+
+
+    def get_orientation_deviation(
+        self,
+    ):
+
+        if self.initial_rotation is None:
+
+            return 0.0
+
+
+        current_rotation = (
+            self.get_rotation()
+        )
+
+
+        return self.rotation_error_rad(
+            self.initial_rotation,
+            current_rotation,
+        )
 
 
     # ========================================================
@@ -318,22 +528,20 @@ class FrankaReachJointEnv(gym.Env):
         current_pos_real,
         current_vel_real,
     ):
-        """
-        Match Gymnasium FlattenObservation ordering for
-        PandaReach Dict observation:
 
-            achieved_goal
-            desired_goal
-            observation
-        """
-
-        current_sim = self.real_to_sim(
-            current_pos_real
+        current_sim = (
+            self.real_to_sim(
+                current_pos_real
+            )
         )
 
-        target_sim = self.real_to_sim(
-            self.target_real
+
+        target_sim = (
+            self.real_to_sim(
+                self.target_real
+            )
         )
+
 
         achieved_goal = (
             current_sim.astype(
@@ -341,11 +549,13 @@ class FrankaReachJointEnv(gym.Env):
             )
         )
 
+
         desired_goal = (
             target_sim.astype(
                 np.float32
             )
         )
+
 
         observation = np.concatenate([
             current_sim,
@@ -353,6 +563,7 @@ class FrankaReachJointEnv(gym.Env):
         ]).astype(
             np.float32
         )
+
 
         flat_obs = np.concatenate([
             achieved_goal,
@@ -362,28 +573,37 @@ class FrankaReachJointEnv(gym.Env):
             np.float32
         )
 
+
         if flat_obs.shape != (12,):
+
             raise RuntimeError(
                 f"Expected 12D observation, "
                 f"got {flat_obs.shape}"
             )
 
+
         return flat_obs
 
 
     # ========================================================
-    # Controller management
+    # Controller
     # ========================================================
 
-    def _start_joint_controller(self):
+    def _start_joint_controller(
+        self,
+    ):
 
-        self.ctrl = controllers.JointPosition(
-            filter_coeff=1.0,
+        self.ctrl = (
+            controllers.JointPosition(
+                filter_coeff=1.0,
+            )
         )
+
 
         self.panda.start_controller(
             self.ctrl
         )
+
 
         self.controller_running = True
 
@@ -394,35 +614,54 @@ class FrankaReachJointEnv(gym.Env):
     ):
 
         q_target = np.asarray(
-        q_target,
-        dtype=np.float64,
+            q_target,
+            dtype=np.float64,
         )
 
+
         if q_target.shape != (7,):
+
             raise ValueError(
-                f"Expected q_target shape (7,), "
+                "Expected q_target shape (7,), "
                 f"got {q_target.shape}"
             )
+
+
+        if not self.controller_running:
+
+            raise RuntimeError(
+                "Joint controller is not running."
+            )
+
 
         self.ctrl.set_control(
             q_target
         )
 
 
-    def _stop_controller(self):
+    def _stop_controller(
+        self,
+    ):
 
         if not self.controller_running:
+
             return
 
+
         try:
+
             self.panda.stop_controller()
 
+
         except Exception as e:
+
             print(
                 f"[controller] stop warning: {e}"
             )
 
+
         finally:
+
             self.controller_running = False
 
             self.ctrl = None
@@ -437,14 +676,19 @@ class FrankaReachJointEnv(gym.Env):
         start_pos,
     ):
 
-        offset = self.np_random.uniform(
-            low=self.goal_low,
-            high=self.goal_high,
+        offset = (
+            self.np_random.uniform(
+                low=self.goal_low,
+                high=self.goal_high,
+            )
         )
 
+
         target = (
-            start_pos + offset
+            start_pos
+            + offset
         )
+
 
         target = np.clip(
             target,
@@ -452,11 +696,12 @@ class FrankaReachJointEnv(gym.Env):
             self.workspace_high,
         )
 
+
         return target
 
 
     # ========================================================
-    # Safety checks
+    # Safety
     # ========================================================
 
     def _check_workspace(
@@ -465,16 +710,20 @@ class FrankaReachJointEnv(gym.Env):
     ):
 
         position = np.asarray(
-            position
+            position,
+            dtype=np.float64,
         )
+
 
         return bool(
             np.all(
-                position >= self.workspace_low
+                position
+                >= self.workspace_low
             )
             and
             np.all(
-                position <= self.workspace_high
+                position
+                <= self.workspace_high
             )
         )
 
@@ -488,6 +737,7 @@ class FrankaReachJointEnv(gym.Env):
             q_target,
             dtype=np.float64,
         )
+
 
         return np.clip(
             q_target,
@@ -511,15 +761,18 @@ class FrankaReachJointEnv(gym.Env):
             seed=seed
         )
 
+
         self._stop_controller()
 
-        # ----------------------------------------------------
-        # Return to known start configuration
-        # ----------------------------------------------------
+
+        # ====================================================
+        # Return to known robot start
+        # ====================================================
 
         try:
 
             self.panda.move_to_start()
+
 
         except Exception:
 
@@ -528,7 +781,9 @@ class FrankaReachJointEnv(gym.Env):
                 "-> recover()"
             )
 
+
             self.panda.recover()
+
 
             self.panda.move_to_start()
 
@@ -538,7 +793,13 @@ class FrankaReachJointEnv(gym.Env):
         )
 
 
-        start_pos = self.get_position()
+        # ====================================================
+        # Start state
+        # ====================================================
+
+        start_pos = (
+            self.get_position()
+        )
 
 
         if not self._check_workspace(
@@ -546,33 +807,36 @@ class FrankaReachJointEnv(gym.Env):
         ):
 
             raise RuntimeError(
-                f"Start EE position outside workspace: "
+                "Start EE position outside workspace: "
                 f"{start_pos}"
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
+        # Record orientation BEFORE policy starts moving
+        # ====================================================
+
+        self.initial_rotation = (
+            self.get_rotation()
+        )
+
+
+        # ====================================================
         # Goal
-        #
-        # Benchmark can provide a fixed goal through options:
-        #
-        # options={
-        #     "target_real": np.array([...])
-        # }
-        #
-        # Otherwise online training gets a random goal.
-        # ----------------------------------------------------
+        # ====================================================
 
         if (
             options is not None
-            and
-            "target_real" in options
+            and "target_real" in options
         ):
 
             target = np.asarray(
-                options["target_real"],
+                options[
+                    "target_real"
+                ],
                 dtype=np.float64,
             )
+
 
             target = np.clip(
                 target,
@@ -580,28 +844,39 @@ class FrankaReachJointEnv(gym.Env):
                 self.workspace_high,
             )
 
-            self.target_real = target
+
+            self.target_real = (
+                target
+            )
+
 
         elif (
             options is not None
-            and
-            "goal_offset" in options
+            and "goal_offset" in options
         ):
 
             offset = np.asarray(
-                options["goal_offset"],
+                options[
+                    "goal_offset"
+                ],
                 dtype=np.float64,
             )
 
+
             target = (
-                start_pos + offset
+                start_pos
+                + offset
             )
 
-            self.target_real = np.clip(
-                target,
-                self.workspace_low,
-                self.workspace_high,
+
+            self.target_real = (
+                np.clip(
+                    target,
+                    self.workspace_low,
+                    self.workspace_high,
+                )
             )
+
 
         else:
 
@@ -612,11 +887,17 @@ class FrankaReachJointEnv(gym.Env):
             )
 
 
+        # ====================================================
+        # Episode state
+        # ====================================================
+
         self.prev_pos = (
             start_pos.copy()
         )
 
+
         self.step_count = 0
+
 
         self.ep_return = 0.0
 
@@ -634,12 +915,16 @@ class FrankaReachJointEnv(gym.Env):
         )
 
 
-        # ----------------------------------------------------
-        # Start realtime joint controller
-        # ----------------------------------------------------
+        # ====================================================
+        # Controller
+        # ====================================================
 
         self._start_joint_controller()
 
+
+        # ====================================================
+        # Observation
+        # ====================================================
 
         obs = self.build_observation(
             start_pos,
@@ -651,8 +936,13 @@ class FrankaReachJointEnv(gym.Env):
 
 
         info = {
+
             "distance":
                 self.initial_distance,
+
+            "distance_cm":
+                self.initial_distance
+                * 100.0,
 
             "is_success":
                 float(
@@ -665,6 +955,18 @@ class FrankaReachJointEnv(gym.Env):
 
             "initial_distance":
                 self.initial_distance,
+
+            "orientation_deviation_rad":
+                0.0,
+
+            "orientation_deviation_deg":
+                0.0,
+
+            "max_orientation_deviation_deg":
+                self.max_orientation_deviation_deg,
+
+            "safety_reason":
+                None,
         }
 
 
@@ -692,14 +994,14 @@ class FrankaReachJointEnv(gym.Env):
         if action.shape != (7,):
 
             raise ValueError(
-                f"Expected 7D action, "
+                "Expected 7D action, "
                 f"got shape {action.shape}"
             )
 
 
-        # ----------------------------------------------------
-        # Same clipping as panda-gym
-        # ----------------------------------------------------
+        # ====================================================
+        # Same action clipping as panda-gym
+        # ====================================================
 
         action = np.clip(
             action,
@@ -708,19 +1010,18 @@ class FrankaReachJointEnv(gym.Env):
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # Current joint state
-        # ----------------------------------------------------
+        # ====================================================
 
-        q_current = self.get_q()
+        q_current = (
+            self.get_q()
+        )
 
 
-        # ----------------------------------------------------
-        # EXACT panda-gym mapping
-        #
-        # arm_joint_ctrl *= 0.05
-        # target_q = current_q + arm_joint_ctrl
-        # ----------------------------------------------------
+        # ====================================================
+        # panda-gym joint mapping
+        # ====================================================
 
         delta_q = (
             action
@@ -734,13 +1035,26 @@ class FrankaReachJointEnv(gym.Env):
         )
 
 
-        # ----------------------------------------------------
-        # Safety layer: joint limits
-        # ----------------------------------------------------
+        # ====================================================
+        # Joint safety
+        # ====================================================
+
+        unclipped_q_target = (
+            q_target.copy()
+        )
+
 
         q_target = (
             self._safe_joint_target(
                 q_target
+            )
+        )
+
+
+        joint_target_clipped = bool(
+            not np.allclose(
+                q_target,
+                unclipped_q_target,
             )
         )
 
@@ -750,9 +1064,9 @@ class FrankaReachJointEnv(gym.Env):
         safety_reason = None
 
 
-        # ----------------------------------------------------
-        # Send target
-        # ----------------------------------------------------
+        # ====================================================
+        # Send command
+        # ====================================================
 
         try:
 
@@ -760,9 +1074,11 @@ class FrankaReachJointEnv(gym.Env):
                 q_target
             )
 
+
             time.sleep(
                 self.dt
             )
+
 
         except Exception as e:
 
@@ -770,25 +1086,27 @@ class FrankaReachJointEnv(gym.Env):
                 f"[step] controller error: {e}"
             )
 
+
             truncated = True
+
 
             safety_reason = (
                 "controller_error"
             )
 
 
-        # ----------------------------------------------------
-        # Observe new robot state
-        # ----------------------------------------------------
+        # ====================================================
+        # New robot state
+        # ====================================================
 
         new_pos = (
             self.get_position()
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # Workspace safety
-        # ----------------------------------------------------
+        # ====================================================
 
         if not self._check_workspace(
             new_pos
@@ -796,14 +1114,52 @@ class FrankaReachJointEnv(gym.Env):
 
             truncated = True
 
+
             safety_reason = (
                 "workspace_violation"
             )
 
 
-        # ----------------------------------------------------
+        # ====================================================
+        # Orientation monitoring
+        # ====================================================
+
+        orientation_deviation_rad = (
+            self.get_orientation_deviation()
+        )
+
+
+        orientation_deviation_deg = (
+            np.rad2deg(
+                orientation_deviation_rad
+            )
+        )
+
+
+        if (
+            orientation_deviation_rad
+            > self.max_orientation_deviation_rad
+        ):
+
+            truncated = True
+
+
+            safety_reason = (
+                "orientation_violation"
+            )
+
+
+            print(
+                "[SAFETY] orientation deviation "
+                f"{orientation_deviation_deg:.2f} deg "
+                f"> "
+                f"{self.max_orientation_deviation_deg:.2f} deg"
+            )
+
+
+        # ====================================================
         # Velocity
-        # ----------------------------------------------------
+        # ====================================================
 
         velocity = (
             new_pos
@@ -816,9 +1172,9 @@ class FrankaReachJointEnv(gym.Env):
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # Distance / reward
-        # ----------------------------------------------------
+        # ====================================================
 
         distance = float(
             np.linalg.norm(
@@ -828,7 +1184,9 @@ class FrankaReachJointEnv(gym.Env):
         )
 
 
-        reward = -distance
+        reward = (
+            -distance
+        )
 
 
         self.minimum_distance = min(
@@ -845,9 +1203,9 @@ class FrankaReachJointEnv(gym.Env):
         self.step_count += 1
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # Success
-        # ----------------------------------------------------
+        # ====================================================
 
         terminated = bool(
             distance
@@ -855,9 +1213,9 @@ class FrankaReachJointEnv(gym.Env):
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # Time limit
-        # ----------------------------------------------------
+        # ====================================================
 
         if (
             self.step_count
@@ -866,6 +1224,7 @@ class FrankaReachJointEnv(gym.Env):
 
             truncated = True
 
+
             if safety_reason is None:
 
                 safety_reason = (
@@ -873,9 +1232,9 @@ class FrankaReachJointEnv(gym.Env):
                 )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # Observation
-        # ----------------------------------------------------
+        # ====================================================
 
         obs = self.build_observation(
             new_pos,
@@ -883,16 +1242,18 @@ class FrankaReachJointEnv(gym.Env):
         )
 
 
-        # ----------------------------------------------------
+        # ====================================================
         # Info
-        # ----------------------------------------------------
+        # ====================================================
 
         info = {
+
             "distance":
                 distance,
 
             "distance_cm":
-                distance * 100.0,
+                distance
+                * 100.0,
 
             "minimum_distance":
                 self.minimum_distance,
@@ -902,7 +1263,9 @@ class FrankaReachJointEnv(gym.Env):
                 * 100.0,
 
             "is_success":
-                float(terminated),
+                float(
+                    terminated
+                ),
 
             "step_count":
                 self.step_count,
@@ -916,6 +1279,9 @@ class FrankaReachJointEnv(gym.Env):
             "q_target":
                 q_target.copy(),
 
+            "joint_target_clipped":
+                joint_target_clipped,
+
             "action":
                 action.astype(
                     np.float32
@@ -924,6 +1290,19 @@ class FrankaReachJointEnv(gym.Env):
             "target_real":
                 self.target_real.copy(),
 
+            "orientation_deviation_rad":
+                float(
+                    orientation_deviation_rad
+                ),
+
+            "orientation_deviation_deg":
+                float(
+                    orientation_deviation_deg
+                ),
+
+            "max_orientation_deviation_deg":
+                self.max_orientation_deviation_deg,
+
             "safety_reason":
                 safety_reason,
         }
@@ -931,7 +1310,9 @@ class FrankaReachJointEnv(gym.Env):
 
         return (
             obs,
-            float(reward),
+            float(
+                reward
+            ),
             terminated,
             truncated,
             info,
@@ -942,13 +1323,17 @@ class FrankaReachJointEnv(gym.Env):
     # Close
     # ========================================================
 
-    def close(self):
+    def close(
+        self,
+    ):
 
         self._stop_controller()
+
 
         try:
 
             self.panda.move_to_start()
+
 
         except Exception:
 
@@ -956,7 +1341,9 @@ class FrankaReachJointEnv(gym.Env):
 
                 self.panda.recover()
 
+
                 self.panda.move_to_start()
+
 
             except Exception as e:
 
