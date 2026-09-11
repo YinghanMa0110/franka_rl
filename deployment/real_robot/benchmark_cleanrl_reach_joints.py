@@ -19,19 +19,24 @@ from reach_joint_env import FrankaReachJointEnv
 # ============================================================
 
 ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..")
+    os.path.join(
+        os.path.join(os.path.dirname(__file__), "../..")
+    )
 )
+if ROOT not in sys.path:
+    sys.path.insert(0,ROOT)
 
-TRAIN_DIR = os.path.join(
+CLEANRL_DIR = os.path.join(
     ROOT,
     "training",
     "cleanrl",
 )
 
-sys.path.insert(0, TRAIN_DIR)
+if CLEANRL_DIR not in sys.path:
+    sys.path.insert(0,CLEANRL_DIR)
 
-from ppo_continuous_action import Agent as PPOAgent
-from sac_reach_joints import Actor as SACActor
+from training.cleanrl.ppo_continuous_action import Agent as PPOAgent
+from training.cleanrl.sac_reach_joints import Actor as SACActor
 
 
 # ============================================================
@@ -525,6 +530,12 @@ def main():
         "--checkpoint-step",
         type=int,
         default=20,
+    )
+
+    parser.add_argument(
+        "--episodes",
+        type = int,
+        default=1,
     )
 
     args = parser.parse_args()
